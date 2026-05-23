@@ -145,9 +145,8 @@ pub async fn search_project_inner(
     if wiki_root.exists() {
         let mut searched_files = 0usize;
         for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file()
-                || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
-            {
+            let ext = entry.path().extension().and_then(|s| s.to_str());
+            if !entry.file_type().is_file() || (ext != Some("md") && ext != Some("txt")) {
                 continue;
             }
             searched_files += 1;

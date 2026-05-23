@@ -201,7 +201,7 @@ pub fn start_project_file_watcher(
         ensure_sync_dir(&root)?;
         with_queue_lock(&root, || reset_processing_tasks(&root, &project_id))?;
         enqueue_rescan_changes(&root, &project_id, &source_watch_config)?;
-        process_queue(&app, &root, &project_id)?;
+        process_queue(Some(&app), &root, &project_id)?;
 
         let (tx, rx) = mpsc::sync_channel::<PathBuf>(8_192);
         let app_for_thread = app.clone();
@@ -306,7 +306,7 @@ pub fn start_project_file_watcher(
         }
 
         let queue = with_queue_lock(&root, || read_queue(&root))?;
-        emit_queue(&app, &project_id, &queue);
+        emit_queue(Some(&app), &project_id, &queue);
         Ok(queue)
     })
 }
@@ -330,14 +330,25 @@ pub fn rescan_project_files(
     project_path: String,
     source_watch_config: Option<SourceWatchConfig>,
 ) -> Result<FileChangeRescanResult, String> {
+    rescan_project_files_inner(Some(&app), project_id, project_path, source_watch_config)
+}
+
+pub fn rescan_project_files_inner(
+    app: Option<&AppHandle>,
+    project_id: String,
+    project_path: String,
+    source_watch_config: Option<SourceWatchConfig>,
+) -> Result<FileChangeRescanResult, String> {
     run_guarded("rescan_project_files", || {
         let root = PathBuf::from(project_path);
         let source_watch_config = normalize_source_watch_config(source_watch_config);
         ensure_sync_dir(&root)?;
         enqueue_rescan_changes(&root, &project_id, &source_watch_config)?;
-        let changed_tasks = process_queue(&app, &root, &project_id)?;
+        let changed_tasks = process_queue(app, &root, &project_id)?;
         let queue = with_queue_lock(&root, || read_queue(&root))?;
-        emit_queue(&app, &project_id, &queue);
+        if let Some(a) = app {
+            emit_queue(Some(a), &project_id, &queue);
+        }
         Ok(FileChangeRescanResult {
             queue,
             changed_tasks,
@@ -376,9 +387,9 @@ pub fn retry_file_change_task(
             }
             write_queue(&root, &queue)
         })?;
-        process_queue(&app, &root, &project_id)?;
+        process_queue(Some(&app), &root, &project_id)?;
         let queue = with_queue_lock(&root, || read_queue(&root))?;
-        emit_queue(&app, &project_id, &queue);
+        emit_queue(Some(&app), &project_id, &queue);
         Ok(queue)
     })
 }
@@ -400,7 +411,7 @@ pub fn ignore_file_change_task(
             write_queue(&root, &queue)?;
             read_queue(&root)
         })?;
-        emit_queue(&app, &project_id, &queue);
+        emit_queue(Some(&app), &project_id, &queue);
         Ok(queue)
     })
 }
@@ -468,12 +479,12 @@ fn handle_changed_paths(
     if !is_active_watcher_generation(watcher_generation) {
         return Ok(());
     }
-    process_queue(app, root, project_id)?;
+    process_queue(Some(app), root, project_id)?;
     let queue = with_queue_lock(root, || read_queue(root))?;
     if !is_active_watcher_generation(watcher_generation) {
         return Ok(());
     }
-    emit_queue(app, project_id, &queue);
+    emit_queue(Some(app), project_id, &queue);
     Ok(())
 }
 
@@ -524,12 +535,12 @@ fn rescan_watch_roots(
     if !is_active_watcher_generation(watcher_generation) {
         return Ok(());
     }
-    process_queue(app, root, project_id)?;
+    process_queue(Some(app), root, project_id)?;
     let queue = with_queue_lock(root, || read_queue(root))?;
     if !is_active_watcher_generation(watcher_generation) {
         return Ok(());
     }
-    emit_queue(app, project_id, &queue);
+    emit_queue(Some(app), project_id, &queue);
     Ok(())
 }
 
@@ -788,16 +799,24 @@ fn upsert_task(
     });
 }
 
-fn process_queue(
-    app: &AppHandle,
+pub fn process_queue(
+    app: Option<&AppHandle>,
     root: &Path,
     project_id: &str,
 ) -> Result<Vec<FileChangeTask>, String> {
     process_queue_inner(
         root,
         project_id,
-        |queue| emit_queue(app, project_id, queue),
-        |tasks| emit_changed_batch(app, project_id, tasks),
+        |queue| {
+            if let Some(a) = app {
+                emit_queue(Some(a), project_id, queue);
+            }
+        },
+        |tasks| {
+            if let Some(a) = app {
+                emit_changed_batch(Some(a), project_id, tasks);
+            }
+        },
     )
 }
 
@@ -1205,15 +1224,17 @@ fn merge_kind(existing: &FileChangeKind, incoming: &FileChangeKind) -> FileChang
     }
 }
 
-fn emit_queue(app: &AppHandle, project_id: &str, queue: &FileChangeQueue) {
+fn emit_queue(app: Option<&AppHandle>, project_id: &str, queue: &FileChangeQueue) {
     let payload = FileSyncPayload {
         project_id: project_id.to_string(),
         tasks: queue.tasks.clone(),
     };
-    let _ = app.emit(EVENT_QUEUE_UPDATED, payload);
+    if let Some(app) = app {
+        let _ = app.emit(EVENT_QUEUE_UPDATED, payload);
+    }
 }
 
-fn emit_changed_batch(app: &AppHandle, project_id: &str, tasks: Vec<FileChangeTask>) {
+fn emit_changed_batch(app: Option<&AppHandle>, project_id: &str, tasks: Vec<FileChangeTask>) {
     if tasks.is_empty() {
         return;
     }
@@ -1221,7 +1242,9 @@ fn emit_changed_batch(app: &AppHandle, project_id: &str, tasks: Vec<FileChangeTa
         project_id: project_id.to_string(),
         tasks,
     };
-    let _ = app.emit(EVENT_CHANGED, payload);
+    if let Some(app) = app {
+        let _ = app.emit(EVENT_CHANGED, payload);
+    }
 }
 
 fn ensure_sync_dir(root: &Path) -> Result<(), String> {

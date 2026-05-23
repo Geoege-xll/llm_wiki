@@ -1,6 +1,7 @@
 mod api_server;
 mod clip_server;
 mod commands;
+pub mod omnimind_server;
 mod panic_guard;
 mod proxy;
 mod types;
