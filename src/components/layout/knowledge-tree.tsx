@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react"
 import {
-  FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, ChevronRight, ChevronDown, Layout, Globe, Trash2,
+  FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, TrendingUp, Target, ChevronRight, ChevronDown, Layout, Globe, Trash2,
 } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Button } from "@/components/ui/button"
@@ -9,6 +9,7 @@ import { readFile, listDirectory } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 import { cascadeDeleteWikiPagesWithRefs } from "@/lib/wiki-page-delete"
+import { inferWikiTypeFromPath } from "@/lib/wiki-page-types"
 
 interface WikiPageInfo {
   path: string
@@ -24,8 +25,11 @@ const TYPE_CONFIG: Record<string, { icon: typeof FileText; label: string; color:
   concept:     { icon: Lightbulb,   label: "Concepts",     color: "text-purple-500", order: 2 },
   source:      { icon: BookOpen,    label: "Sources",      color: "text-orange-500", order: 3 },
   synthesis:   { icon: GitMerge,    label: "Synthesis",    color: "text-red-500",    order: 4 },
-  comparison:  { icon: BarChart3,   label: "Comparisons",  color: "text-emerald-500",order: 5 },
-  query:       { icon: HelpCircle,  label: "Queries",      color: "text-green-500",  order: 6 },
+  finding:     { icon: TrendingUp,  label: "Findings",     color: "text-purple-500", order: 5 },
+  thesis:      { icon: Target,      label: "Theses",       color: "text-rose-500",   order: 6 },
+  methodology: { icon: BookOpen,    label: "Methodologies",color: "text-teal-500",   order: 7 },
+  comparison:  { icon: BarChart3,   label: "Comparisons",  color: "text-emerald-500",order: 8 },
+  query:       { icon: HelpCircle,  label: "Queries",      color: "text-green-500",  order: 9 },
 }
 
 const DEFAULT_CONFIG = { icon: FileText, label: "Other", color: "text-muted-foreground", order: 99 }
@@ -323,13 +327,7 @@ function parsePageInfo(path: string, fileName: string, content: string): WikiPag
 
   // Fallback: infer type from path
   if (type === "other") {
-    if (path.includes("/entities/")) type = "entity"
-    else if (path.includes("/concepts/")) type = "concept"
-    else if (path.includes("/sources/")) type = "source"
-    else if (path.includes("/queries/")) type = "query"
-    else if (path.includes("/comparisons/")) type = "comparison"
-    else if (path.includes("/synthesis/")) type = "synthesis"
-    else if (fileName === "overview.md") type = "overview"
+    type = inferWikiTypeFromPath(path, fileName) ?? "other"
   }
 
   return { path, title, type, tags, origin }

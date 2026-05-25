@@ -26,6 +26,22 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.4.13",
+    date: "2026-05-24",
+    highlights: {
+      en: [
+        "Improved local API and search reliability, including shared backend search behavior.",
+        "Fixed source handling edge cases for nested folders, non-English paths, and Windows compatibility.",
+        "Fixed search provider configuration and Codex CLI Windows behavior issues.",
+      ],
+      zh: [
+        "改进本地 API 与搜索稳定性，包括统一后端搜索能力。",
+        "修复嵌套资料文件夹、非英文路径和 Windows 兼容相关的资料处理问题。",
+        "修复搜索 Provider 配置和 Codex CLI 在 Windows 下的体验问题。",
+      ],
+    },
+  },
+  {
     version: "0.4.12",
     date: "2026-05-19",
     highlights: {

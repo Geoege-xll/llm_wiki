@@ -27,6 +27,9 @@ const NODE_TYPE_COLORS: Record<string, string> = {
   synthesis: "#f87171", // red-400
   overview: "#facc15",  // yellow-400
   comparison: "#2dd4bf", // teal-400
+  finding: "#a855f7",    // purple-500
+  thesis: "#f43f5e",     // rose-500
+  methodology: "#14b8a6", // teal-500
   other: "#94a3b8",     // slate-400
 }
 
@@ -385,6 +388,9 @@ export function GraphView() {
       synthesis: t("graph.nodeTypeLabels.synthesis"),
       overview: t("graph.nodeTypeLabels.overview"),
       comparison: t("graph.nodeTypeLabels.comparison"),
+      finding: t("graph.nodeTypeLabels.finding"),
+      thesis: t("graph.nodeTypeLabels.thesis"),
+      methodology: t("graph.nodeTypeLabels.methodology"),
       other: t("graph.nodeTypeLabels.other"),
     })
   }, [t])
