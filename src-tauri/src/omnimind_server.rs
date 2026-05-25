@@ -134,6 +134,12 @@ struct DeleteFileRequest {
     path: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractImagesRequest {
+    source_path: String,
+}
+
 fn get_target_project(project_id: Option<&str>) -> Result<ProjectEntry, String> {
     match project_id {
         Some(id) => resolve_project(id),
@@ -259,6 +265,107 @@ fn handle_get_file_content(query: &str) -> OmnimindResponse {
     }
 }
 
+fn handle_extract_images(project_id: &str, body: &str) -> OmnimindResponse {
+    let req: ExtractImagesRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => return error_response(400, "INVALID_JSON", &format!("Invalid JSON: {e}")),
+    };
+
+    if req.source_path.trim().is_empty() {
+        return error_response(
+            400,
+            "SOURCE_PATH_REQUIRED",
+            "sourcePath must not be empty",
+        );
+    }
+
+    let project = match resolve_project(project_id) {
+        Ok(project) => project,
+        Err(e) => return error_response(404, "PROJECT_NOT_FOUND", &e),
+    };
+
+    // 这里强制把 Python 传来的相对路径重新锚定到 project 根目录，
+    // 防止 server-only 模式被外部调用方借道访问任意磁盘路径。
+    let source_full_path = match safe_join(&project.path, &req.source_path) {
+        Ok(path) => path,
+        Err(e) => return error_response(400, "INVALID_PATH", &e),
+    };
+
+    if !source_full_path.exists() {
+        return error_response(404, "SOURCE_NOT_FOUND", "Source file does not exist");
+    }
+    if source_full_path.is_dir() {
+        return error_response(400, "SOURCE_NOT_FILE", "sourcePath must point to a file");
+    }
+
+    // 所有抽出的图片统一落到当前项目的 `wiki/media/<slug>/`，
+    // 这样后续 raw markdown、source summary 与检索链路都能复用同一套相对路径语义。
+    let wiki_root = match safe_join(&project.path, "wiki") {
+        Ok(path) => path,
+        Err(e) => return error_response(500, "INVALID_WIKI_ROOT", &e),
+    };
+
+    let file_name = source_full_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("source");
+    let media_slug = safe_media_slug(file_name);
+    let media_dir = wiki_root.join("media").join(&media_slug);
+    let source_string = source_full_path.to_string_lossy().to_string();
+    let ext = source_full_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // 提取算法本体完全复用现有 Rust 原生实现；
+    // server-only 这里仅做项目解析、路径约束与协议封装，不复制算法。
+    let extracted = match ext.as_str() {
+        "pdf" => match tauri::async_runtime::block_on(
+            commands::extract_images::extract_and_save_pdf_images_cmd(
+                source_string.clone(),
+                media_dir.to_string_lossy().to_string(),
+                wiki_root.to_string_lossy().to_string(),
+            ),
+        ) {
+            Ok(images) => images,
+            Err(e) => {
+                return error_response(500, "EXTRACT_IMAGES_FAILED", &e);
+            }
+        },
+        "pptx" | "docx" | "xlsx" => match tauri::async_runtime::block_on(
+            commands::extract_images::extract_and_save_office_images_cmd(
+                source_string.clone(),
+                media_dir.to_string_lossy().to_string(),
+                wiki_root.to_string_lossy().to_string(),
+            ),
+        ) {
+            Ok(images) => images,
+            Err(e) => {
+                return error_response(500, "EXTRACT_IMAGES_FAILED", &e);
+            }
+        },
+        _ => {
+            return error_response(
+                400,
+                "UNSUPPORTED_SOURCE_TYPE",
+                "Only pdf, pptx, docx and xlsx support explicit image extraction",
+            )
+        }
+    };
+
+    OmnimindResponse {
+        status: 200,
+        body: json!({
+            "ok": true,
+            "projectId": project.id,
+            "sourcePath": req.source_path,
+            "mediaDir": format!("wiki/media/{media_slug}"),
+            "images": extracted,
+        }),
+    }
+}
+
 fn handle_delete(path: &str, request: &mut tiny_http::Request) -> OmnimindResponse {
     let parts: Vec<&str> = path
         .trim_start_matches('/')
@@ -336,6 +443,10 @@ fn handle_post(path: &str, request: &mut tiny_http::Request) -> OmnimindResponse
         ["api", "v1", "projects", project_id, "vector-delete"] => {
             let body = read_request_body(request).unwrap_or_default();
             handle_vector_delete_page(project_id, &body)
+        }
+        ["api", "v1", "projects", project_id, "extract-images"] => {
+            let body = read_request_body(request).unwrap_or_default();
+            handle_extract_images(project_id, &body)
         }
         ["api", "v1", "projects", _project_id, "chat"] => error_response(
             501,
@@ -1040,6 +1151,35 @@ fn project_name_from_path(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("Project")
         .to_string()
+}
+
+fn safe_media_slug(file_name: &str) -> String {
+    // 这里故意采用保守 ASCII slug 规则，与 Python 侧 source fallback 路径习惯保持一致，
+    // 目的是降低跨语言链路里“同一源文件生成不同媒体目录名”的概率。
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(file_name);
+    let mut slug = String::with_capacity(stem.len());
+    let mut prev_dash = false;
+
+    for ch in stem.chars() {
+        let keep = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-');
+        if keep {
+            slug.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+
+    let trimmed = slug.trim_matches(|ch| ch == '-' || ch == '.' || ch == '_');
+    if trimmed.is_empty() {
+        "source".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn normalize_path(path: &str) -> String {

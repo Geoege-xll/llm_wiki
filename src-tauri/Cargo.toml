@@ -15,6 +15,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "llm-wiki"
 path = "src/main.rs"
 
+[[bin]]
+name = "omnimind-server"
+path = "src/bin/omnimind-server.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

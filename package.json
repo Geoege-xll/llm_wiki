@@ -11,8 +11,8 @@
     "test": "npm run test:mocks && npm run test:llm",
     "test:mocks": "vitest run --exclude='**/*.real-llm.test.ts'",
     "test:llm": "vitest run real-llm --no-file-parallelism --reporter=verbose",
-    "server:dev": "cargo run --manifest-path src-tauri/Cargo.toml --bin llm-wiki -- --server-only",
-    "server:build": "cargo build --manifest-path src-tauri/Cargo.toml --release --bin llm-wiki",
+    "server:dev": "cargo run --manifest-path src-tauri/Cargo.toml --bin omnimind-server",
+    "server:build": "cargo build --manifest-path src-tauri/Cargo.toml --release --bin omnimind-server",
     "server:test": "cargo test --manifest-path src-tauri/Cargo.toml omnimind_server -- --nocapture",
     "tauri": "tauri"
   },
