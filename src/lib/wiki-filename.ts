@@ -41,8 +41,8 @@ export function makeQuerySlug(title: string): string {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
     .toLowerCase()
-    .slice(0, 50)
-  return slug.length > 0 ? slug : "query"
+  const truncated = Array.from(slug).slice(0, 50).join("")
+  return truncated.length > 0 ? truncated : "query"
 }
 
 /** Produce the full wiki filename. Accepts an injected `now` for

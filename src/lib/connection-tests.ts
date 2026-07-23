@@ -7,6 +7,15 @@ export interface ProviderTestResult {
   message: string
 }
 
+export const LLM_PROVIDER_TEST_MAX_TOKENS = 512
+
+function configForProviderTest(cfg: LlmConfig): LlmConfig {
+  if (cfg.provider === "claude-code" || cfg.provider === "codex-cli") {
+    return { ...cfg, localCliIsolation: true }
+  }
+  return cfg
+}
+
 export async function testEmbeddingConnection(cfg: EmbeddingConfig): Promise<ProviderTestResult> {
   if (!cfg.endpoint.trim()) {
     return { ok: false, message: "Embedding endpoint is empty." }
@@ -62,11 +71,12 @@ export async function testEmbeddingFunction(cfg: EmbeddingConfig): Promise<Provi
 
 export async function testLlmConnection(cfg: LlmConfig): Promise<ProviderTestResult> {
   const started = performance.now()
+  const testCfg = configForProviderTest(cfg)
   let content = ""
   let errorMessage: string | null = null
 
   await streamChat(
-    cfg,
+    testCfg,
     [
       { role: "system", content: "You are a connection checker. Reply briefly." },
       { role: "user", content: "Reply with one short word." },
@@ -77,7 +87,7 @@ export async function testLlmConnection(cfg: LlmConfig): Promise<ProviderTestRes
       onError: (err) => { errorMessage = err.message },
     },
     undefined,
-    { max_tokens: 32, reasoning: { mode: "off" } },
+    { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
   )
 
   if (errorMessage) return { ok: false, message: errorMessage }
@@ -89,11 +99,12 @@ export async function testLlmConnection(cfg: LlmConfig): Promise<ProviderTestRes
 }
 
 export async function testLlmFunction(cfg: LlmConfig): Promise<ProviderTestResult> {
+  const testCfg = configForProviderTest(cfg)
   let content = ""
   let errorMessage: string | null = null
 
   await streamChat(
-    cfg,
+    testCfg,
     [
       {
         role: "system",
@@ -107,7 +118,7 @@ export async function testLlmFunction(cfg: LlmConfig): Promise<ProviderTestResul
       onError: (err) => { errorMessage = err.message },
     },
     undefined,
-    { max_tokens: 32, reasoning: { mode: "off" } },
+    { max_tokens: LLM_PROVIDER_TEST_MAX_TOKENS, reasoning: { mode: "off" } },
   )
 
   if (errorMessage) return { ok: false, message: errorMessage }

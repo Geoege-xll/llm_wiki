@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> | 中文 | <a href="README_JA.md">日本語</a>
+  <a href="README.md">English</a> | 中文 | <a href="README_JA.md">日本語</a> | <a href="README_KO.md">한국어</a>
 </p>
 
 ---
@@ -32,6 +32,10 @@
 
 - **两步思维链摄入** — LLM 先分析再生成 Wiki 页面，来源可追溯，支持增量缓存
 - **多模态图片摄入** — 自动提取 PDF 内嵌图片，调用视觉模型生成事实性描述，搜索结果按图文分区，支持 lightbox 预览与跳转到原始文档对应位置
+- **多格式文档解析** — 支持 PDF、Office 文档、EPUB/MOBI、Org mode、图片、音视频、网页剪藏和批量 URL 导入，并提供内置、云端或本地 MinerU PDF 处理
+- **灵活的模型配置** — 支持项目级模型配置、Chat/Ingest 独立模型路由，以及自定义 Provider、请求头和流式输出
+- **原始资料检索** — 可使用“只读原文”模式，仅依据导入的原始资料回答
+- **项目管理与迁移** — 支持完整项目归档的跨设备导入导出，并可根据现有 Wiki 页面重建索引
 - **四信号知识图谱** — 直接链接、来源重叠、Adamic-Adar、类型亲和四维关联度模型
 - **Louvain 社区检测** — 自动发现知识聚类，内聚度评分
 - **图谱洞察** — 惊奇连接与知识空白检测，一键触发 Deep Research
@@ -40,15 +44,19 @@
 - **文件夹导入** — 递归导入保留目录结构，文件夹路径作为 LLM 分类上下文
 - **Source 文件夹自动监听** — 检测 `raw/sources/` 的外部变更，并同步触发摄入或删除清理
 - **深度研究** — LLM 智能生成搜索主题，通过 Tavily、SerpApi 或 SearXNG 进行多查询网络搜索，研究结果自动摄入 Wiki
+- **Rust 后端 Chat Agent** — 支持工具调用的聊天运行时，可进行 Wiki/Source/Graph/Web 检索、workspace 文件生成、shell 审批、取消和流式工具事件展示
+- **Agent Skills** — 扫描并启用本地 `SKILL.md` 目录，在聊天中用 `/skill` 选择，让 Agent 按需读取 Skill 指令
+- **生成物预览** — Agent 生成的 Markdown、HTML、图片等 workspace 文件会作为生成物展示，支持预览和快速打开目录
+- **Mermaid 流程图渲染** — 聊天和预览中可直接渲染 Mermaid 代码块，语法错误会显示为紧凑错误卡片
 - **异步审核系统** — LLM 在摄入时标记需人工判断的项，预定义操作，预生成搜索查询
 - **Chrome 网页剪藏** — 一键捕获网页内容，自动摄入知识库
-- **本地 HTTP API + AI Agent Skill** — 内置 `127.0.0.1:19828` JSON API（Token 鉴权），支持 Hybrid 检索、文件读取、知识图谱遍历、源资料重新扫描；配套 [agent skill](https://github.com/nashsu/llm_wiki_skill) 一行命令接入 Claude Code / Codex（`npx skills add …`）
+- **本地 HTTP API + MCP Server + AI Agent Skill** — 内置 `127.0.0.1:19828` JSON API 和随包提供的 MCP Server，支持 Hybrid 检索、文件读取、知识图谱遍历、源资料重新扫描；配套 [agent skill](https://github.com/nashsu/llm_wiki_skill) 一行命令接入 Claude Code / Codex（`npx skills add …`）
 
 ## 这是什么？
 
 LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有组织、相互关联的知识库。与传统 RAG（每次查询都从头检索和回答）不同，LLM 会从你的资料中**增量构建并维护一个持久化的 Wiki**。知识只编译一次并持续更新，而非每次查询都重新推导。
 
-本项目基于 [Karpathy 的 LLM Wiki 方法论](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) —— 一套使用 LLM 构建个人知识库的方法论。我们将其核心理念实现为一个完整的桌面应用，并做了大量增强。
+本项目基于 [Karpathy 的 LLM Wiki 方法论](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) —— 一套使用 LLM 构建个人知识库的方法论。llm_wiki 由 [nash_su](https://x.com/nash_su) 创建和维护，并在保留核心理念的基础上，将其实现为完整桌面应用，加入了大量增强。
 
 <p align="center">
   <img src="assets/llm_wiki_arch.jpg" width="100%" alt="LLM Wiki 架构图">
@@ -236,7 +244,17 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 - **重新生成** —— 一键重新生成最后一条回复（移除最后的助手+用户消息对，重新发送）
 - **保存到 Wiki** —— 将有价值的回答归档到 `wiki/queries/`，然后自动摄入提取实体/概念到知识网络
 
-### 9. 思维链 / 推理过程展示
+### 9. Rust 后端 Chat Agent 与 Skills
+
+原始设计中没有。聊天现在由 Rust 后端 Agent runtime 驱动，而不是只在浏览器端运行 TypeScript 循环：
+
+- **工具型 Agent** —— 可自主选择 Wiki 检索、Source 检索、图谱检索、网页搜索、AnyTXT、workspace 文件工具、已批准的 shell 命令和 Skill 文件读取
+- **Skill 管理** —— 扫描项目级和用户级 Skill 目录，启用或禁用 Skill，并在每个会话中通过 `/skill` 补全选择 Skill
+- **生成物管理** —— Agent 工具生成的文件统一放在 `agent-workspace/` 下，并作为生成物在聊天中展示、预览或打开目录
+- **用户交互表单** —— Skill 可以请求单选、多选或自由文本等结构化用户输入，不需要为每个 Skill 硬编码专用界面
+- **更安全的执行模型** —— 项目 workspace 内的命令可以顺畅继续执行，外部 shell 命令仍需要明确批准
+
+### 10. 思维链 / 推理过程展示
 
 原始设计中没有。针对会输出 `<think>` 块的 LLM（DeepSeek、QwQ 等）：
 
@@ -244,16 +262,18 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 - **默认折叠** —— 生成完成后思维块隐藏，点击展开
 - **视觉分离** —— 思维内容以独特样式显示，与主回复分开
 
-### 10. KaTeX 数学公式渲染
+### 11. Markdown 渲染：KaTeX 数学公式与 Mermaid 图表
 
-原始设计中没有。跨所有视图的完整 LaTeX 数学支持：
+原始设计中没有。聊天和预览支持更丰富的 Markdown 渲染：
 
 - **KaTeX 渲染** —— 行内 `$...$` 和块级 `$$...$$` 公式通过 remark-math + rehype-katex 渲染
 - **Milkdown 数学插件** —— 预览编辑器通过 @milkdown/plugin-math 原生渲染数学公式
 - **自动检测** —— 裸 `\begin{aligned}` 等 LaTeX 环境自动补上 `$$` 定界符
 - **Unicode 降级** —— 100+ 符号映射（α, ∑, →, ≤ 等）用于数学块外的简单行内符号
+- **Mermaid 代码块** —— fenced `mermaid` 代码块可直接渲染为流程图、时序图等 Mermaid 支持的图表
+- **紧凑 Mermaid 错误** —— 语法错误会被收敛到小型错误卡片中，不会把原始解析器输出铺满聊天界面
 
-### 11. 审核系统（异步人机协作）
+### 12. 审核系统（异步人机协作）
 
 原始设计建议在摄入时全程参与。我们新增了**异步审核队列**：
 
@@ -262,7 +282,7 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 - **摄入时生成搜索查询** —— LLM 预先为每个审核项生成优化的网络搜索查询
 - 用户可在方便时处理审核 —— 不阻塞摄入流程
 
-### 12. 深度研究
+### 13. 深度研究
 
 <p align="center">
   <img src="assets/1-deepresearch.jpg" width="100%" alt="深度研究">
@@ -281,7 +301,7 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 - **任务队列** —— 最多 3 个并发任务
 - **研究面板** —— 专用侧边面板，动态高度，实时流式进度
 
-### 13. 浏览器扩展（网页剪藏）
+### 14. 浏览器扩展（网页剪藏）
 
 <p align="center">
   <img src="assets/4-chrome_extension_webclipper.jpg" width="100%" alt="Chrome 扩展网页剪藏">
@@ -297,21 +317,24 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 - **剪藏监听** —— 每 3 秒轮询新剪藏，自动处理
 - **离线预览** —— 即使应用未运行也能显示提取的内容
 
-### 14. 多格式文档支持
+### 15. 多格式文档支持
 
 原始设计聚焦于纯文本/Markdown。我们支持保留文档语义的结构化提取：
 
 | 格式 | 方法 |
 |------|------|
-| PDF | pdf-extract（Rust）+ 文件缓存 |
+| PDF | 内置 pdf-extract（Rust）+ 文件缓存；可选 MinerU 云端、Local API 或 Pipeline 模式解析复杂排版 |
 | DOCX | docx-rs —— 标题、加粗/斜体、列表、表格 → 结构化 Markdown |
 | PPTX | ZIP + XML —— 逐页提取，保留标题/列表结构 |
 | XLSX/XLS/ODS | calamine —— 正确的单元格类型、多工作表支持、Markdown 表格 |
+| EPUB/MOBI | 提取电子书元数据、章节和正文，转换为可摄取内容 |
 | 图片 | 原生预览（png, jpg, gif, webp, svg 等） |
 | 视频/音频 | 内置播放器 |
 | 网页剪藏 | Readability.js + Turndown.js → 干净的 Markdown |
 
-### 15. 文件删除级联清理
+> MinerU 是可选功能。复杂 PDF 可使用 MinerU 云端、官方 Local API 或本地 Pipeline 模式；本地模式无需上传文件，提取的图片会保存到项目管理的 `wiki/media` 目录。若 MinerU 失败，LLM Wiki 会回退到内置解析器。
+
+### 16. 文件删除级联清理
 
 原始设计没有删除机制。我们新增了**智能级联删除**：
 
@@ -321,7 +344,7 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 - **索引清理** —— 被移除的页面从 index.md 中清除
 - **Wiki 链接清理** —— 指向已删除页面的失效 `[[wikilinks]]` 从其余 Wiki 页面中移除
 
-### 16. 可配置上下文窗口
+### 17. 可配置上下文窗口
 
 原始设计中没有。用户可配置 LLM 接收多少上下文：
 
@@ -329,7 +352,7 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 - **比例预算分配** —— 更大的窗口按比例获得更多 Wiki 内容
 - **60/20/5/15 分配** —— Wiki 页面 / 聊天历史 / 索引 / 系统提示
 
-### 17. 跨平台兼容
+### 18. 跨平台兼容
 
 原始设计与平台无关（抽象模式）。我们处理了具体的跨平台问题：
 
@@ -340,14 +363,17 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 - **Tauri v2** —— macOS、Windows、Linux 原生桌面
 - **GitHub Actions CI/CD** —— 自动构建 macOS（ARM + Intel）、Windows（.msi）、Linux（.deb / .AppImage）
 
-### 18. 其他新增
+### 19. 其他新增
 
 - **国际化** —— 中英文界面（react-i18next）
 - **设置持久化** —— LLM 提供商、API 密钥、模型、上下文大小、语言通过 Tauri Store 保存
 - **Obsidian 配置** —— 自动生成 `.obsidian/` 目录及推荐设置
 - **Markdown 渲染** —— 带边框的 GFM 表格、代码块、聊天和预览中的 wikilink 处理
 - **多 LLM 提供商** —— OpenAI、Anthropic、Google、Ollama、自定义 —— 各有特定的流式传输和请求头
-- **15 分钟超时** —— 长时间摄入操作不会过早失败
+- **可配置 LLM 超时** —— 可针对较慢的本地模型和长任务调整请求超时
+- **可配置 Firecrawl** —— 支持可选 API Key 和自定义 Base URL，可连接托管或自部署服务
+- **可折叠文件侧栏** —— 可收起 Knowledge/Files 导航并保存折叠状态
+- **项目维护** —— 支持 ZIP 导入导出迁移和确定性重建 `wiki/index.md`
 - **dataVersion 信号** —— 图谱和 UI 在 Wiki 内容变更时自动刷新
 
 ## 技术栈
@@ -361,8 +387,7 @@ LLM Wiki 是一个跨平台桌面应用，能将你的文档自动转化为有�
 | 图谱 | sigma.js + graphology + ForceAtlas2 |
 | 搜索 | 分词搜索 + 图谱关联度 + 可选向量（LanceDB） |
 | 向量数据库 | LanceDB（Rust，嵌入式，可选） |
-| PDF | pdf-extract |
-| Office | docx-rs + calamine |
+| 文档解析 | pdf-extract + MinerU 云端/本地 + docx-rs + calamine + EPUB/MOBI 提取 |
 | 国际化 | react-i18next |
 | 状态管理 | Zustand |
 | LLM | 流式 fetch（OpenAI、Anthropic、Google、Ollama、自定义） |
@@ -394,6 +419,7 @@ npm run tauri build    # 生产构建
 2. 启用「开发者模式」
 3. 点击「加载已解压的扩展程序」
 4. 选择 `extension/` 目录
+5. 使用 `Alt+Shift+L`（macOS 为 `Command+Shift+L`）直接剪藏当前页面；可在 `chrome://extensions/shortcuts` 中自定义快捷键
 
 ## 快速开始
 
@@ -407,7 +433,7 @@ npm run tauri build    # 生产构建
 8. 查看 **审核** 处理需要你关注的项目
 9. 定期运行 **Lint** 维护 Wiki 健康度
 
-## 本地 HTTP API + AI Agent Skill
+## 本地 HTTP API + MCP Server + AI Agent Skill
 
 LLM Wiki 内置一个本地 HTTP API（监听 `http://127.0.0.1:19828`，Token 鉴权，仅本机可达），任何外部工具——包括 **Claude Code**、**Codex** 这类 AI Agent，或者任意能发 HTTP 请求的脚本——都可以直接查询你的知识库：
 
@@ -415,17 +441,20 @@ LLM Wiki 内置一个本地 HTTP API（监听 `http://127.0.0.1:19828`，Token �
 - `GET /api/v1/projects` —— 项目列表
 - `GET /api/v1/projects/{id}/files` / `files/content` —— 读取文件树与内容
 - `POST /api/v1/projects/{id}/search` —— **Hybrid 混合检索**（关键词 + 向量），返回 `mode`、`tokenHits`、`vectorHits`，每条结果带 `vectorScore`
+- `POST /api/v1/projects/{id}/chat` —— 非流式 Rust 后端 Agent 聊天接口，返回助手消息、引用、用量和工具事件；支持 Wiki/Source/Web/AnyTXT 检索，`mode: "deep"` 会扩展证据收集范围
 - `GET /api/v1/projects/{id}/graph` —— Wikilinks 知识图谱
 - `POST /api/v1/projects/{id}/sources/rescan` —— 触发后端重新扫描
 
-在 **设置 → API 服务** 中开启 API 并生成 Token。
+在 **设置 → API + MCP** 中开启 API、生成 Token，并按需选择是否允许本机无鉴权访问。
+
+对于兼容 MCP 的客户端，LLM Wiki 还内置了 `mcp-server/`。执行 `npm run mcp:build` 构建后，**设置 → API + MCP** 会展示一份可复制的 MCP 客户端配置，并自动填入当前机器上的真实入口路径。MCP 工具复用同一套 API 能力，因此 Agent 可以直接列出项目、读取文件、执行 Hybrid 检索、查看图谱、触发资料源重新扫描，并调用同一套 Rust 后端 Agent 聊天接口，不需要再手写 HTTP 调用。
 
 ### 一条命令把 AI Agent 接进你的知识库
 
 LLM Wiki 配套的 **agent skill** 单独维护在另一个仓库。把它装进 Claude Code / Codex / 任意兼容 skills 的 runtime：
 
 ```bash
-npx skills add https://github.com/nashsu/llm_wiki_skill.git --skill llm_wiki_skill
+npx skills add https://github.com/nashsu/llm_wiki_skill.git --skill llm-wiki
 ```
 
 安装完成后，Agent 就能响应 "我的 LLM Wiki 里关于 X 是怎么说的"、"在我的知识库里搜 Y"、"展示我 wiki 图谱里 Z 的邻居"、"重新索引我的资料源" 等请求——直接调用本机运行的 App，默认只读，引用 wiki 页面路径方便你在 App 内核对。

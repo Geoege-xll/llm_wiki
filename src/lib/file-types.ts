@@ -93,10 +93,16 @@ const EXT_MAP: Record<string, FileCategory> = {
   m4a: "audio",
   wma: "audio",
 
+  // Standalone Mermaid sources use the same renderer as fenced Mermaid
+  // blocks. Keep them in the code family so callers load their UTF-8 source
+  // before handing the content to FilePreview.
+  mmd: "code",
+  mermaid: "code",
+
   // PDF
   pdf: "pdf",
 
-  // Documents (binary, not directly previewable)
+  // Documents. Some are previewable through backend text extraction.
   doc: "document",
   docx: "document",
   xls: "document",
@@ -110,6 +116,8 @@ const EXT_MAP: Record<string, FileCategory> = {
   numbers: "document",
   key: "document",
   epub: "document",
+  mobi: "document",
+  org: "document",
 
   // Data
   json: "data",
@@ -128,6 +136,30 @@ export function getFileCategory(filePath: string): FileCategory {
 
 export function isTextReadable(category: FileCategory): boolean {
   return ["markdown", "text", "code", "data"].includes(category)
+}
+
+export const EXTRACTED_TEXT_PREVIEW_EXTENSIONS = new Set([
+  "pdf",
+  "doc",
+  "docx",
+  "pptx",
+  "xls",
+  "xlsx",
+  "odt",
+  "ods",
+  "odp",
+  "epub",
+  "mobi",
+  "org",
+])
+
+export function getFileExtension(filePath: string): string {
+  const fileName = filePath.split(/[\\/]/).pop() ?? ""
+  return fileName.includes(".") ? fileName.split(".").pop()?.toLowerCase() ?? "" : ""
+}
+
+export function isExtractedTextPreviewFile(filePath: string): boolean {
+  return EXTRACTED_TEXT_PREVIEW_EXTENSIONS.has(getFileExtension(filePath))
 }
 
 export function isBinary(category: FileCategory): boolean {
@@ -156,6 +188,8 @@ export function getCodeLanguage(filePath: string): string {
     yaml: "yaml",
     yml: "yaml",
     xml: "xml",
+    mmd: "mermaid",
+    mermaid: "mermaid",
     sh: "bash",
     bash: "bash",
     toml: "toml",

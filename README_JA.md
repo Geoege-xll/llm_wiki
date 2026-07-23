@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> | <a href="README_CN.md">中文</a> | 日本語
+  <a href="README.md">English</a> | <a href="README_CN.md">中文</a> | 日本語 | <a href="README_KO.md">한국어</a>
 </p>
 
 ---
@@ -32,6 +32,10 @@
 
 - **2 段階 Chain-of-Thought インジェスト** — LLM がまず分析を行い、その後ソース追跡可能な Wiki ページを生成。増分キャッシュ対応
 - **マルチモーダル画像インジェスト** — PDF 内の埋め込み画像を抽出し、Vision LLM で事実ベースのキャプションを生成。画像対応の検索結果、ライトボックスプレビュー、元資料の該当位置へのジャンプに対応
+- **マルチフォーマット文書解析** — PDF、Office 文書、EPUB/MOBI、Org mode、画像、メディア、Web クリップ、URL の一括インポートに対応し、内蔵・クラウド・ローカル MinerU による PDF 処理を選択可能
+- **柔軟なモデル設定** — プロジェクト単位のモデル設定、Chat/Ingest の個別ルーティング、カスタム Provider、リクエストヘッダー、ストリーミング出力に対応
+- **原資料に基づく検索** — 「原資料のみ」モードで、インポートした原資料だけに基づいて回答
+- **プロジェクト管理と移行** — 完全なプロジェクトアーカイブを端末間でインポート／エクスポートし、既存 Wiki ページからインデックスを再構築可能
 - **4 シグナル知識グラフ** — 直接リンク、ソース重複、Adamic-Adar、タイプ親和性による関連度モデル
 - **Louvain コミュニティ検出** — 知識クラスタを自動発見し、凝集度を評価
 - **グラフインサイト** — 意外な関連や知識の空白を検出し、ワンクリックで Deep Research を起動
@@ -40,15 +44,19 @@
 - **フォルダインポート** — ディレクトリ構造を保持した再帰インポート。フォルダパスを LLM の分類ヒントとして利用
 - **ソースフォルダの自動監視** — `raw/sources/` の外部変更を検出し、インジェスト・削除クリーンアップを同期
 - **Deep Research** — LLM が検索トピックを最適化生成し、Tavily / SerpApi / SearXNG によるマルチクエリ Web 検索結果を自動で Wiki 化
+- **Rust バックエンド Chat Agent** — Wiki / Source / Graph / Web 検索、workspace ファイル生成、shell 承認、キャンセル、ストリーミング tool event に対応するツール実行型チャット runtime
+- **Agent Skills** — ローカル `SKILL.md` フォルダをスキャンして有効化し、チャット内の `/skill` で選択。Agent が必要に応じて Skill 指示を読み込みます
+- **生成物プレビュー** — Agent が作成した Markdown、HTML、画像などの workspace ファイルを生成物として表示し、プレビューとフォルダをすばやく開く操作に対応
+- **Mermaid 図表レンダリング** — チャットとプレビューで Mermaid コードブロックを直接描画し、構文エラーはコンパクトなエラーカードで表示
 - **非同期レビューシステム** — LLM が人間の判断を要する項目を作成し、定義済みアクションと事前生成された検索クエリを付与
 - **Chrome Web Clipper** — Web ページをワンクリックで取り込み、知識ベースへ自動インジェスト
-- **ローカル HTTP API + AI Agent Skill** — `127.0.0.1:19828` の JSON API（Token 認証）でハイブリッド検索、ファイル読み取り、グラフ探索、ソース再スキャンを提供。専用の [agent skill](https://github.com/nashsu/llm_wiki_skill) はワンコマンドで Claude Code / Codex に追加可能（`npx skills add …`）
+- **ローカル HTTP API + MCP Server + AI Agent Skill** — `127.0.0.1:19828` の JSON API と同梱 MCP Server でハイブリッド検索、ファイル読み取り、グラフ探索、ソース再スキャンを提供。専用の [agent skill](https://github.com/nashsu/llm_wiki_skill) はワンコマンドで Claude Code / Codex に追加可能（`npx skills add …`）
 
 ## これは何ですか？
 
 LLM Wiki は、手元の文書を整理された相互リンク付きの知識ベースへ自動変換するクロスプラットフォームのデスクトップアプリです。従来の RAG のように毎回ゼロから検索して回答するのではなく、LLM が資料から**永続的な Wiki を増分的に構築・維持**します。知識は一度コンパイルされた後は継続的に更新され、質問のたびに再推論する必要はありません。
 
-このプロジェクトは、LLM を使ってパーソナル知識ベースを構築する方法論である [Karpathy の LLM Wiki パターン](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) に基づいています。そのコアアイデアを実用的なデスクトップアプリとして実装し、大幅な拡張を加えました。
+このプロジェクトは、LLM を使ってパーソナル知識ベースを構築する方法論である [Karpathy の LLM Wiki パターン](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) に基づいています。llm_wiki は [nash_su](https://x.com/nash_su) によって作成・メンテナンスされ、コアアイデアを実用的なデスクトップアプリとして実装し、大幅な拡張を加えています。
 
 <p align="center">
   <img src="assets/llm_wiki_arch.jpg" width="100%" alt="LLM Wiki アーキテクチャ">
@@ -244,7 +252,17 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 - **再生成** — 最後の回答をワンクリックで再生成（直近の assistant + user メッセージ対を削除して再送信）
 - **Wiki に保存** — 価値のある回答を `wiki/queries/` に保管し、自動インジェストでエンティティ／概念を知識ネットワークに抽出
 
-### 9. 思考過程（Thinking / Reasoning）の表示
+### 9. Rust バックエンド Chat Agent と Skills
+
+元の設計にはありません。チャットはブラウザ内だけの TypeScript ループではなく、Rust バックエンドの Agent runtime で実行されます。
+
+- **ツール実行型 Agent** — Wiki 検索、Source 検索、Graph 検索、Web 検索、AnyTXT、workspace ファイルツール、承認済み shell コマンド、Skill ファイル読み取りを選択可能
+- **Skill 管理** — プロジェクト単位・ユーザー単位の Skill フォルダをスキャンし、有効／無効を切り替え、会話ごとに `/skill` 補完で Skill を選択
+- **生成 workspace 出力** — Agent ツールが作成したファイルは `agent-workspace/` 配下に保存され、生成物として表示・プレビュー・フォルダオープンできます
+- **ユーザー入力フォーム** — Skill は単一選択、複数選択、自由入力などの構造化入力を要求でき、Skill ごとの専用 UI をハードコードする必要はありません
+- **より安全な実行モデル** — プロジェクト workspace 内のコマンドはスムーズに継続し、外部 shell コマンドは引き続き明示的な承認を要求します
+
+### 10. 思考過程（Thinking / Reasoning）の表示
 
 元の設計にはありません。`<think>` ブロックを出力する LLM（DeepSeek、QwQ など）向けです。
 
@@ -252,16 +270,18 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 - **デフォルトで折りたたみ** — 完了後は思考ブロックを隠し、クリックで展開
 - **視覚的な分離** — 思考内容はメインの回答とは別のスタイルで表示
 
-### 10. KaTeX による数式レンダリング
+### 11. Markdown レンダリング: KaTeX 数式と Mermaid 図表
 
-元の設計にはありません。全画面で LaTeX 数式をサポートします。
+元の設計にはありません。チャットとプレビューでよりリッチな Markdown 表示をサポートします。
 
 - **KaTeX レンダリング** — インライン `$...$` とブロック `$$...$$` の数式を remark-math + rehype-katex で描画
 - **Milkdown 数式プラグイン** — プレビューエディタが @milkdown/plugin-math でネイティブに数式を描画
 - **自動検出** — むき出しの `\begin{aligned}` などの LaTeX 環境を自動的に `$$` で囲む
 - **Unicode フォールバック** — 数式ブロック外のシンプルなインライン表記用に 100 以上の記号マッピング（α, ∑, →, ≤ など）
+- **Mermaid コードブロック** — fenced `mermaid` ブロックをフローチャート、シーケンス図など Mermaid 対応の図表として直接描画
+- **コンパクトな Mermaid エラー** — 構文エラーは小さなエラーカード内に収め、チャット画面に生の parser 出力を広げません
 
-### 11. レビューシステム（非同期 Human-in-the-Loop）
+### 12. レビューシステム（非同期 Human-in-the-Loop）
 
 元の設計ではインジェスト中に人間が関与することが推奨されています。本プロジェクトでは**非同期レビューキュー**を追加しました。
 
@@ -270,7 +290,7 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 - **インジェスト時に検索クエリを生成** — LLM がレビュー項目ごとに最適化された Web 検索クエリを事前生成
 - ユーザーは好きなタイミングでレビュー可能。インジェスト処理を妨げない
 
-### 12. Deep Research
+### 13. Deep Research
 
 <p align="center">
   <img src="assets/1-deepresearch.jpg" width="100%" alt="Deep Research">
@@ -289,7 +309,7 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 - **タスクキュー** — 最大 3 件の同時実行
 - **リサーチパネル** — 高さが動的に変わる専用サイドバー。ストリーミング進捗をリアルタイム表示
 
-### 13. ブラウザ拡張（Web Clipper）
+### 14. ブラウザ拡張（Web Clipper）
 
 <p align="center">
   <img src="assets/4-chrome_extension_webclipper.jpg" width="100%" alt="Chrome 拡張 Web Clipper">
@@ -305,21 +325,24 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 - **クリップ監視** — 3 秒ごとに新しいクリップをポーリングして自動処理
 - **オフラインプレビュー** — アプリが起動していなくても抽出済みコンテンツを表示
 
-### 14. 複数フォーマットのドキュメントサポート
+### 15. 複数フォーマットのドキュメントサポート
 
 元の設計はテキスト／Markdown が中心です。本プロジェクトではドキュメントの意味構造を保持した構造化抽出に対応しています。
 
 | フォーマット | 抽出方法 |
 |--------------|----------|
-| PDF | pdf-extract（Rust）+ ファイルキャッシュ |
+| PDF | 内蔵 pdf-extract（Rust）+ ファイルキャッシュ。複雑なレイアウト向けに MinerU Cloud、Local API、Pipeline を任意で利用可能 |
 | DOCX | docx-rs — 見出し、太字／斜体、リスト、テーブルを構造化 Markdown へ |
 | PPTX | ZIP + XML — スライド単位で抽出し、見出し／リスト構造を保持 |
 | XLSX/XLS/ODS | calamine — 正しいセル型、複数シート対応、Markdown テーブルに変換 |
+| EPUB/MOBI | 電子書籍のメタデータ、章、本文を抽出し、インジェスト可能なコンテンツへ変換 |
 | 画像 | ネイティブプレビュー（png, jpg, gif, webp, svg など） |
 | 動画／音声 | 内蔵プレイヤー |
 | Web クリップ | Readability.js + Turndown.js → クリーンな Markdown |
 
-### 15. ファイル削除のカスケードクリーンアップ
+> MinerU は任意機能です。複雑な PDF には MinerU Cloud、公式 Local API、またはローカル Pipeline モードを利用できます。ローカルモードではファイルを外部へ送信せず、抽出画像はプロジェクト管理下の `wiki/media` に保存されます。失敗時は内蔵解析へフォールバックします。
+
+### 16. ファイル削除のカスケードクリーンアップ
 
 元の設計には削除機構がありません。本プロジェクトでは**インテリジェントなカスケード削除**を追加しました。
 
@@ -329,7 +352,7 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 - **index のクリーンアップ** — 削除されたページを index.md から除去
 - **wikilink のクリーンアップ** — 削除済みページを指す失効した `[[wikilinks]]` を、残りの Wiki ページから除去
 
-### 16. 設定可能なコンテキストウィンドウ
+### 17. 設定可能なコンテキストウィンドウ
 
 元の設計にはありません。LLM に渡すコンテキスト量をユーザーが設定できます。
 
@@ -337,7 +360,7 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 - **比例配分された予算** — ウィンドウが大きいほど Wiki コンテンツの取り分も増える
 - **60/20/5/15 の配分** — Wiki ページ／チャット履歴／index／システムプロンプト
 
-### 17. クロスプラットフォーム互換
+### 18. クロスプラットフォーム互換
 
 元の設計はプラットフォーム非依存の抽象パターンです。本プロジェクトでは実際のクロスプラットフォーム問題に対処しています。
 
@@ -348,14 +371,17 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 - **Tauri v2** — macOS、Windows、Linux のネイティブデスクトップ
 - **GitHub Actions による CI/CD** — macOS（ARM + Intel）、Windows（.msi）、Linux（.deb / .AppImage）の自動ビルド
 
-### 18. その他の追加機能
+### 19. その他の追加機能
 
 - **多言語対応** — 英語と中国語の UI（react-i18next）
 - **設定の永続化** — LLM プロバイダー、API キー、モデル、コンテキストサイズ、言語を Tauri Store で保存
 - **Obsidian 設定** — 推奨設定入りの `.obsidian/` ディレクトリを自動生成
 - **Markdown レンダリング** — 枠線付きの GFM テーブル、整形されたコードブロック、チャットとプレビュー内での wikilink 処理
 - **マルチプロバイダー LLM 対応** — OpenAI、Anthropic、Google、Ollama、カスタム。プロバイダーごとにストリーミングとヘッダーを調整
-- **15 分タイムアウト** — 長時間のインジェスト処理が早すぎる段階で失敗しないようにする
+- **設定可能な LLM タイムアウト** — 遅いローカルモデルや長時間処理に合わせてリクエスト時間を調整
+- **設定可能な Firecrawl** — API キーとカスタム Base URL により、ホスト型・セルフホスト型の両方に対応
+- **折りたたみ可能なファイルサイドバー** — Knowledge/Files ナビゲーションを折りたたみ、状態を保持
+- **プロジェクト保守** — ZIP による移行用インポート／エクスポートと `wiki/index.md` の再構築
 - **dataVersion シグナル** — Wiki コンテンツの変更に合わせてグラフと UI を自動リフレッシュ
 
 ## 技術スタック
@@ -369,8 +395,7 @@ LLM Wiki は、手元の文書を整理された相互リンク付きの知識�
 | グラフ | sigma.js + graphology + ForceAtlas2 |
 | 検索 | トークン化検索 + グラフ関連度 + 任意のベクトル検索（LanceDB） |
 | ベクトル DB | LanceDB（Rust、組み込み、オプション） |
-| PDF | pdf-extract |
-| Office | docx-rs + calamine |
+| 文書解析 | pdf-extract + MinerU Cloud/Local + docx-rs + calamine + EPUB/MOBI 抽出 |
 | 多言語対応 | react-i18next |
 | 状態管理 | Zustand |
 | LLM | ストリーミング fetch（OpenAI、Anthropic、Google、Ollama、カスタム） |
@@ -403,6 +428,7 @@ npm run tauri build    # 本番ビルド
 2. 「デベロッパーモード」を有効にする
 3. 「パッケージ化されていない拡張機能を読み込む」をクリック
 4. `extension/` ディレクトリを選択
+5. `Alt+Shift+L`（macOS は `Command+Shift+L`）で現在のページを直接クリップ。`chrome://extensions/shortcuts` で変更できます
 
 ## クイックスタート
 
@@ -416,7 +442,7 @@ npm run tauri build    # 本番ビルド
 8. **レビュー** で対応が必要な項目を確認
 9. **Lint** を定期的に実行し、Wiki の健全性を維持
 
-## ローカル HTTP API + AI Agent Skill
+## ローカル HTTP API + MCP Server + AI Agent Skill
 
 LLM Wiki は組み込みのローカル HTTP API（`http://127.0.0.1:19828` でリッスン、Token 認証、ローカルホストのみ）を提供します。**Claude Code** や **Codex** などの AI エージェント、または HTTP リクエストを発行できる任意のスクリプトから、直接知識ベースを問い合わせることができます。
 
@@ -424,17 +450,20 @@ LLM Wiki は組み込みのローカル HTTP API（`http://127.0.0.1:19828` で�
 - `GET /api/v1/projects` — プロジェクト一覧
 - `GET /api/v1/projects/{id}/files` / `files/content` — ファイルツリーと本文の取得
 - `POST /api/v1/projects/{id}/search` — **ハイブリッド検索**（キーワード + ベクトル）。`mode`、`tokenHits`、`vectorHits` を返し、各結果に `vectorScore` を付与
+- `POST /api/v1/projects/{id}/chat` — 非ストリーミングの Rust バックエンド Agent chat エンドポイント。assistant message、references、usage、tool events を返し、Wiki / Source / Web / AnyTXT 検索に対応します。`mode: "deep"` では証拠収集範囲を広げます
 - `GET /api/v1/projects/{id}/graph` — wikilinks の知識グラフ
 - `POST /api/v1/projects/{id}/sources/rescan` — バックエンドの再スキャンをトリガー
 
-**設定 → API サーバー** から API を有効化し、Token を発行してください。
+**設定 → API + MCP** から API を有効化し、Token を発行できます。必要に応じて、ローカルからの認証なしアクセスも切り替えられます。
+
+MCP 互換クライアント向けに、LLM Wiki には `mcp-server/` も同梱されています。`npm run mcp:build` でビルドしたあと、**設定 → API + MCP** に現在のマシンに合ったパス入りの MCP クライアント設定が表示され、そのままコピーできます。MCP ツールは同じ API を利用するため、エージェントはプロジェクト一覧、ファイル読み取り、ハイブリッド検索、グラフ参照、ソース再スキャン、同じ Rust バックエンド Agent chat エンドポイントの呼び出しをカスタム HTTP 実装なしで実行できます。
 
 ### ワンコマンドで AI エージェントを接続
 
 LLM Wiki 用の **agent skill** は別リポジトリで管理されています。Claude Code / Codex / skills 互換のランタイムにインストールできます。
 
 ```bash
-npx skills add https://github.com/nashsu/llm_wiki_skill.git --skill llm_wiki_skill
+npx skills add https://github.com/nashsu/llm_wiki_skill.git --skill llm-wiki
 ```
 
 インストール後、エージェントは「自分の LLM Wiki に X について何が書かれている？」「自分の知識ベースで Y を検索して」「自分の Wiki グラフで Z の近傍を表示して」「ソースを再スキャンして」といった依頼に対し、ローカルで動いているアプリと直接通信して応答します。デフォルトは読み取り専用で、アプリ内で確認できるよう Wiki ページのパスを引用します。

@@ -1,8 +1,51 @@
-import { describe, it, expect } from "vitest"
+import { beforeEach, describe, it, expect, vi } from "vitest"
+
+const tauriMocks = vi.hoisted(() => {
+  const listeners: Record<string, (event: { payload: unknown }) => void> = {}
+  return {
+    invoke: vi.fn(async (_command: string, _payload?: unknown): Promise<unknown> => undefined),
+    listen: vi.fn(async (event: string, cb: (event: { payload: unknown }) => void) => {
+      listeners[event] = cb
+      return vi.fn(() => {
+        delete listeners[event]
+      })
+    }),
+    emit: (event: string, payload: unknown) => listeners[event]?.({ payload }),
+    reset: () => {
+      for (const event of Object.keys(listeners)) {
+        delete listeners[event]
+      }
+    },
+  }
+})
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: tauriMocks.invoke,
+}))
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: tauriMocks.listen,
+}))
+
 import {
   createClaudeCodeStreamParser,
   buildExitError,
+  streamClaudeCodeCli,
 } from "../claude-cli-transport"
+import { useWikiStore } from "@/stores/wiki-store"
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  tauriMocks.reset()
+  tauriMocks.invoke.mockResolvedValue(undefined)
+  useWikiStore.setState({
+    project: {
+      id: "project-1",
+      name: "Project",
+      path: "/Users/me/wiki-project",
+    },
+  })
+})
 
 describe("createClaudeCodeStreamParser", () => {
   it("emits text from a single stream_event text_delta", () => {
@@ -121,6 +164,255 @@ describe("createClaudeCodeStreamParser", () => {
         }),
       ),
     ).toBeNull()
+  })
+})
+
+describe("streamClaudeCodeCli", () => {
+  it("does not resolve until the Claude CLI done event arrives", async () => {
+    const callbacks = {
+      onToken: vi.fn(),
+      onDone: vi.fn(),
+      onError: vi.fn(),
+    }
+    let settled = false
+    let resolveSpawn: (() => void) | undefined
+    tauriMocks.invoke.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveSpawn = resolve
+    }))
+
+    const stream = streamClaudeCodeCli(
+      {
+        provider: "claude-code",
+        apiKey: "",
+        model: "claude-sonnet-4-6",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 200000,
+      },
+      [{ role: "user", content: "Analyze this source." }],
+      callbacks,
+    ).finally(() => {
+      settled = true
+    })
+
+    await vi.waitFor(() => {
+      expect(tauriMocks.invoke).toHaveBeenCalledTimes(1)
+    })
+    expect(tauriMocks.invoke).toHaveBeenCalledWith(
+      "claude_cli_spawn",
+      expect.objectContaining({
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "Analyze this source." }],
+        workingDirectory: "/Users/me/wiki-project",
+      }),
+    )
+
+    expect(resolveSpawn).toBeTypeOf("function")
+    let spawnSettled = false
+    void Promise.resolve(tauriMocks.invoke.mock.results[0]?.value).then(() => {
+      spawnSettled = true
+    })
+    resolveSpawn?.()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(spawnSettled).toBe(true)
+    expect(settled).toBe(false)
+
+    const payload = tauriMocks.invoke.mock.calls[0]?.[1] as { streamId: string }
+    tauriMocks.emit(
+      `claude-cli:${payload.streamId}`,
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "structured analysis" },
+        },
+      }),
+    )
+    tauriMocks.emit(`claude-cli:${payload.streamId}:done`, { code: 0, stderr: "" })
+
+    await stream
+
+    expect(callbacks.onToken).toHaveBeenCalledWith("structured analysis")
+    expect(callbacks.onDone).toHaveBeenCalledTimes(1)
+    expect(callbacks.onError).not.toHaveBeenCalled()
+  })
+
+  it("passes local CLI isolation preference to the Rust transport", async () => {
+    const callbacks = {
+      onToken: vi.fn(),
+      onDone: vi.fn(),
+      onError: vi.fn(),
+    }
+
+    const stream = streamClaudeCodeCli(
+      {
+        provider: "claude-code",
+        apiKey: "",
+        model: "claude-sonnet-4-6",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 200000,
+        localCliIsolation: true,
+      },
+      [{ role: "user", content: "Analyze this source." }],
+      callbacks,
+    )
+
+    await vi.waitFor(() => {
+      expect(tauriMocks.invoke).toHaveBeenCalledWith(
+        "claude_cli_spawn",
+        expect.objectContaining({ isolateLocalConfig: true }),
+      )
+    })
+
+    const payload = tauriMocks.invoke.mock.calls[0]?.[1] as { streamId: string }
+    tauriMocks.emit(
+      `claude-cli:${payload.streamId}`,
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "ok" }] },
+      }),
+    )
+    tauriMocks.emit(`claude-cli:${payload.streamId}:done`, { code: 0, stderr: "" })
+
+    await stream
+  })
+
+  it("passes the active project path as the Claude CLI working directory", async () => {
+    const callbacks = {
+      onToken: vi.fn(),
+      onDone: vi.fn(),
+      onError: vi.fn(),
+    }
+
+    const stream = streamClaudeCodeCli(
+      {
+        provider: "claude-code",
+        apiKey: "",
+        model: "claude-sonnet-4-6",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 200000,
+      },
+      [{ role: "user", content: "Analyze this source." }],
+      callbacks,
+    )
+
+    await vi.waitFor(() => {
+      expect(tauriMocks.invoke).toHaveBeenCalledWith(
+        "claude_cli_spawn",
+        expect.objectContaining({ workingDirectory: "/Users/me/wiki-project" }),
+      )
+    })
+
+    const payload = tauriMocks.invoke.mock.calls[0]?.[1] as { streamId: string }
+    tauriMocks.emit(
+      `claude-cli:${payload.streamId}`,
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "ok" }] },
+      }),
+    )
+    tauriMocks.emit(`claude-cli:${payload.streamId}:done`, { code: 0, stderr: "" })
+
+    await stream
+  })
+
+  it("surfaces an error without spawning when no project is active", async () => {
+    useWikiStore.setState({ project: null })
+    const callbacks = {
+      onToken: vi.fn(),
+      onDone: vi.fn(),
+      onError: vi.fn(),
+    }
+
+    await streamClaudeCodeCli(
+      {
+        provider: "claude-code",
+        apiKey: "",
+        model: "claude-sonnet-4-6",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 200000,
+      },
+      [{ role: "user", content: "Analyze this source." }],
+      callbacks,
+    )
+
+    expect(tauriMocks.invoke).not.toHaveBeenCalledWith("claude_cli_spawn", expect.anything())
+    expect(tauriMocks.listen).not.toHaveBeenCalled()
+    expect(callbacks.onError).toHaveBeenCalledTimes(1)
+    expect(callbacks.onError.mock.calls[0]?.[0]).toMatchObject({
+      message: expect.stringMatching(/working directory/),
+    })
+  })
+
+  it("surfaces a clear error when completion has no assistant text", async () => {
+    const callbacks = {
+      onToken: vi.fn(),
+      onDone: vi.fn(),
+      onError: vi.fn(),
+    }
+
+    const stream = streamClaudeCodeCli(
+      {
+        provider: "claude-code",
+        apiKey: "",
+        model: "claude-sonnet-4-6",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 200000,
+      },
+      [{ role: "user", content: "Analyze this source." }],
+      callbacks,
+    )
+
+    await vi.waitFor(() => {
+      expect(tauriMocks.invoke).toHaveBeenCalledTimes(1)
+    })
+
+    const payload = tauriMocks.invoke.mock.calls[0]?.[1] as { streamId: string }
+    tauriMocks.emit(`claude-cli:${payload.streamId}:done`, { code: 0, stderr: "" })
+
+    await stream
+
+    expect(callbacks.onToken).not.toHaveBeenCalled()
+    expect(callbacks.onDone).not.toHaveBeenCalled()
+    expect(callbacks.onError).toHaveBeenCalledTimes(1)
+    expect(callbacks.onError.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        message: expect.stringContaining("completed but returned no content"),
+      }),
+    )
+  })
+
+  it("does not spawn when the signal is already aborted", async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const callbacks = {
+      onToken: vi.fn(),
+      onDone: vi.fn(),
+      onError: vi.fn(),
+    }
+
+    await streamClaudeCodeCli(
+      {
+        provider: "claude-code",
+        apiKey: "",
+        model: "claude-sonnet-4-6",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 200000,
+      },
+      [{ role: "user", content: "Analyze this source." }],
+      callbacks,
+      controller.signal,
+    )
+
+    expect(tauriMocks.invoke).not.toHaveBeenCalled()
+    expect(tauriMocks.listen).not.toHaveBeenCalled()
+    expect(callbacks.onDone).toHaveBeenCalledTimes(1)
+    expect(callbacks.onError).not.toHaveBeenCalled()
   })
 })
 

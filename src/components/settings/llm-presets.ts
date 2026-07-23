@@ -1,4 +1,4 @@
-import type { AzureModelFamily } from "@/stores/wiki-store"
+import type { AzureModelFamily, CustomLlmPreset } from "@/stores/wiki-store"
 
 /**
  * Curated LLM provider presets.
@@ -185,6 +185,35 @@ export const LLM_PRESETS: LlmPreset[] = [
     suggestedContextSize: 64000,
   },
   {
+    id: "atlascloud",
+    label: "Atlas Cloud",
+    hint: "api.atlascloud.ai",
+    provider: "custom",
+    baseUrl: "https://api.atlascloud.ai/v1",
+    defaultModel: "deepseek-ai/deepseek-v4-pro",
+    apiMode: "chat_completions",
+    // Atlas Cloud is a full-modal inference platform exposing many model
+    // families (DeepSeek, Qwen, GLM, Kimi, MiniMax, Claude, GPT, Gemini…)
+    // behind a single OpenAI-compatible /v1/chat/completions endpoint, so
+    // it reuses the generic chat-completions wire like the other hosted
+    // gateways above. `deepseek-v4-pro` is a reasoning model — leave the
+    // context window generous. Full catalog is large and rotates; this is
+    // a practical subset and users can type any other id into the input.
+    suggestedModels: [
+      "deepseek-ai/deepseek-v4-pro",
+      "deepseek-ai/deepseek-v4-flash",
+      "deepseek-ai/deepseek-v3.2",
+      "Qwen/Qwen3-Next-80B-A3B-Instruct",
+      "moonshotai/kimi-k2.6",
+      "zai-org/glm-5",
+      "minimaxai/minimax-m2.7",
+      "anthropic/claude-sonnet-4.6",
+      "openai/gpt-5.5",
+      "google/gemini-3.5-flash",
+    ],
+    suggestedContextSize: 128000,
+  },
+  {
     id: "groq",
     label: "Groq",
     hint: "api.groq.com",
@@ -300,6 +329,22 @@ export const LLM_PRESETS: LlmPreset[] = [
     suggestedContextSize: 256000,
   },
   {
+    id: "kimi-coding-plan",
+    label: "Kimi (Coding Plan)",
+    hint: "api.kimi.com",
+    provider: "custom",
+    baseUrl: "https://api.kimi.com/coding/",
+    defaultModel: "kimi-for-coding",
+    apiMode: "chat_completions",
+    // Kimi Coding Plan is a separate subscription service from the
+    // Moonshot open platform. It supports both OpenAI-compatible
+    // (chat_completions) and Anthropic-compatible (anthropic_messages)
+    // wires on the same base URL. The Anthropic wire requires Bearer
+    // auth (see requiresBearerAuth in llm-providers.ts).
+    suggestedModels: ["kimi-for-coding"],
+    suggestedContextSize: 256000,
+  },
+  {
     id: "zhipu",
     label: "智谱 GLM (Zhipu)",
     hint: "open.bigmodel.cn",
@@ -307,21 +352,31 @@ export const LLM_PRESETS: LlmPreset[] = [
     baseUrl: "https://open.bigmodel.cn/api/paas/v4",
     defaultModel: "glm-4.6",
     apiMode: "chat_completions",
-    // Current-gen Zhipu BigModel lineup. glm-5 / glm-5.1 are routed
-    // through the Z.AI international endpoint (api.z.ai) so they're
-    // not on this preset's suggestion list — users targeting those
-    // should type the id or point the base URL at api.z.ai.
+    // Current Zhipu BigModel lineup on /api/paas/v4/chat/completions.
+    // Vision-capable models use the same OpenAI-compatible image_url
+    // content blocks as our generic chat-completions wire.
     suggestedModels: [
+      "glm-5.1",
+      "glm-5-turbo",
+      "glm-5",
+      "glm-5v-turbo",
+      "glm-4.7",
+      "glm-4.7-flash",
+      "glm-4.7-flashx",
       "glm-4.6",
+      "glm-4.6v",
       "glm-4.5",
+      "glm-4.5v",
       "glm-4.5-air",
       "glm-4.5-airx",
       "glm-4.5-flash",
+      "glm-4-flash-250414",
+      "glm-4-flashx-250414",
       "glm-4-plus",
       "glm-4-air",
       "glm-4-flash",
-      "glm-zero-preview",
       "glm-4v-plus",
+      "glm-zero-preview",
     ],
     suggestedContextSize: 128000,
   },
@@ -331,11 +386,13 @@ export const LLM_PRESETS: LlmPreset[] = [
     hint: "api.minimax.io/anthropic",
     provider: "custom",
     baseUrl: "https://api.minimax.io/anthropic",
-    defaultModel: "MiniMax-M2.7",
+    defaultModel: "MiniMax-M3",
     apiMode: "anthropic_messages",
-    // Current-gen only. M2 and M2.1 are legacy and being retired —
-    // users who need them can type the id into the custom input.
-    suggestedModels: ["MiniMax-M2.7", "MiniMax-M2.5"],
+    // M3 is the current-gen default; M2.7 stays as a fallback for users
+    // pinned to it. Older M2.5 / M2.1 / M2 are legacy and have been
+    // dropped — users who still need them can type the id into the
+    // custom input.
+    suggestedModels: ["MiniMax-M3", "MiniMax-M2.7"],
     suggestedContextSize: 200000,
   },
   {
@@ -344,9 +401,9 @@ export const LLM_PRESETS: LlmPreset[] = [
     hint: "api.minimaxi.com/anthropic",
     provider: "custom",
     baseUrl: "https://api.minimaxi.com/anthropic",
-    defaultModel: "MiniMax-M2.7",
+    defaultModel: "MiniMax-M3",
     apiMode: "anthropic_messages",
-    suggestedModels: ["MiniMax-M2.7", "MiniMax-M2.5"],
+    suggestedModels: ["MiniMax-M3", "MiniMax-M2.7"],
     suggestedContextSize: 200000,
   },
   {
@@ -389,14 +446,24 @@ export const LLM_PRESETS: LlmPreset[] = [
     provider: "custom",
     baseUrl: "https://api.xiaomimimo.com/v1",
     apiMode: "chat_completions",
-    // Standard OpenAI-wire endpoint at api.xiaomimimo.com/v1.
-    // Preflight explicitly whitelists `authorization` + `content-type`,
-    // so browser fetch would work too — but all LLM calls still go
-    // through the Tauri HTTP plugin for uniformity. Model list from
-    // hermes-agent (hermes_cli/models.py:247-251).
-    defaultModel: "mimo-v2-pro",
-    suggestedModels: ["mimo-v2-pro", "mimo-v2-omni", "mimo-v2-flash"],
-    suggestedContextSize: 131072,
+    baseUrlByMode: {
+      chat_completions: "https://token-plan-cn.xiaomimimo.com/v1",
+      anthropic_messages: "https://token-plan-cn.xiaomimimo.com/anthropic",
+    },
+    // Official OpenAI-compatible endpoint at api.xiaomimimo.com/v1.
+    // Token Plan users can switch API mode to the CN OpenAI/Anthropic
+    // gateways above. MiMo V2.5 Pro / Omni advertise 1M context;
+    // Flash remains the low-cost 256K option. Older v2 ids stay
+    // selectable for existing users and gateway deployments.
+    defaultModel: "mimo-v2.5-pro",
+    suggestedModels: [
+      "mimo-v2.5-pro",
+      "mimo-v2.5",
+      "mimo-v2-flash",
+      "mimo-v2-pro",
+      "mimo-v2-omni",
+    ],
+    suggestedContextSize: 1000000,
   },
   {
     id: "volcengine-ark",
@@ -466,6 +533,23 @@ export const LLM_PRESETS: LlmPreset[] = [
     // No suggestedModels: user knows what their gateway exposes.
   },
 ]
+
+export function availableLlmPresets(customPresets: CustomLlmPreset[] = []): LlmPreset[] {
+  return [
+    ...LLM_PRESETS,
+    ...customPresets.map((preset) => ({
+      id: preset.id,
+      label: preset.label,
+      hint: "Custom OpenAI- or Anthropic-compatible endpoint",
+      provider: "custom" as const,
+      apiMode: "chat_completions" as const,
+    })),
+  ]
+}
+
+export function findLlmPreset(id: string, customPresets: CustomLlmPreset[] = []): LlmPreset | undefined {
+  return availableLlmPresets(customPresets).find((preset) => preset.id === id)
+}
 
 /**
  * Best-effort reverse lookup: given the current LlmConfig fields, which

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
+import { invoke } from "@tauri-apps/api/core"
+import { open, save } from "@tauri-apps/plugin-dialog"
 import {
   Wrench,
   Loader2,
@@ -9,6 +11,8 @@ import {
   Trash2,
   RotateCcw,
   Clock,
+  Archive,
+  ListRestart,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
@@ -21,10 +25,15 @@ import {
   cancelTask,
   retryTask,
   getQueue,
+  getQueueSummary,
+  resumeProcessing,
   groupKey,
   type DedupTask,
 } from "@/lib/dedup-queue"
 import type { DuplicateGroup } from "@/lib/dedup"
+import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
+import { openProject } from "@/commands/fs"
+import { addToRecentProjects } from "@/lib/project-store"
 
 interface GroupUiEntry {
   group: DuplicateGroup
@@ -52,15 +61,57 @@ export function MaintenanceSection() {
   const [scanError, setScanError] = useState<string | null>(null)
   const [groups, setGroups] = useState<GroupUiEntry[]>([])
   const [scanCompleted, setScanCompleted] = useState(false)
+  const [projectToolStatus, setProjectToolStatus] = useState<string | null>(null)
+  const [projectToolBusy, setProjectToolBusy] = useState(false)
+
+  const handleRebuildIndex = useCallback(async () => {
+    if (!project) return
+    setProjectToolBusy(true)
+    try {
+      const result = await invoke<{ pages: number; groups: number }>("rebuild_wiki_index", { projectPath: project.path })
+      await refreshProjectFileTree(project.path, { bumpDataVersion: true })
+      setProjectToolStatus(t("settings.sections.maintenance.projectData.rebuilt", { pages: result.pages, groups: result.groups }))
+    } catch (error) { setProjectToolStatus(String(error)) } finally { setProjectToolBusy(false) }
+  }, [project, t])
+
+  const handleExportProject = useCallback(async () => {
+    if (!project) return
+    const destination = await save({ defaultPath: `${project.name}.llmwiki.zip`, filters: [{ name: "LLM Wiki project", extensions: ["zip"] }] })
+    if (!destination) return
+    setProjectToolBusy(true)
+    try {
+      await invoke("export_project_archive", { projectPath: project.path, destination })
+      setProjectToolStatus(t("settings.sections.maintenance.projectData.exported", { path: destination }))
+    } catch (error) { setProjectToolStatus(String(error)) } finally { setProjectToolBusy(false) }
+  }, [project, t])
+
+  const handleImportProject = useCallback(async () => {
+    const archive = await open({ multiple: false, filters: [{ name: "LLM Wiki project", extensions: ["zip"] }] })
+    if (!archive || Array.isArray(archive)) return
+    const destination = await open({ directory: true, multiple: false, createDirectories: true })
+    if (!destination || Array.isArray(destination)) return
+    setProjectToolBusy(true)
+    try {
+      const path = await invoke<string>("import_project_archive", { archivePath: archive, destination })
+      const imported = await openProject(path)
+      await addToRecentProjects(imported)
+      setProjectToolStatus(t("settings.sections.maintenance.projectData.imported", { name: imported.name }))
+    } catch (error) { setProjectToolStatus(String(error)) } finally { setProjectToolBusy(false) }
+  }, [t])
 
   // Poll the queue at 1Hz so the UI reflects pending → processing →
   // failed transitions and cross-window queue activity (e.g. a merge
   // that completed while the user was on a different settings tab).
   // Same pattern activity-panel uses for ingest-queue.
   const [tasks, setTasks] = useState<readonly DedupTask[]>([])
+  const [queueSummary, setQueueSummary] = useState(() => getQueueSummary())
   useEffect(() => {
     setTasks([...getQueue()])
-    const id = setInterval(() => setTasks([...getQueue()]), 1000)
+    setQueueSummary(getQueueSummary())
+    const id = setInterval(() => {
+      setTasks([...getQueue()])
+      setQueueSummary(getQueueSummary())
+    }, 1000)
     return () => clearInterval(id)
   }, [])
 
@@ -107,6 +158,7 @@ export function MaintenanceSection() {
         // Refresh immediately so the card flips to "queued" without
         // waiting for the next 1s poll tick.
         setTasks([...getQueue()])
+        setQueueSummary(getQueueSummary())
       } catch (err) {
         console.error("[Maintenance] enqueue failed:", err)
       }
@@ -117,11 +169,19 @@ export function MaintenanceSection() {
   const handleCancel = useCallback(async (taskId: string) => {
     await cancelTask(taskId)
     setTasks([...getQueue()])
+    setQueueSummary(getQueueSummary())
   }, [])
 
   const handleRetry = useCallback(async (taskId: string) => {
     await retryTask(taskId)
     setTasks([...getQueue()])
+    setQueueSummary(getQueueSummary())
+  }, [])
+
+  const handleResumeRestoredQueue = useCallback(() => {
+    resumeProcessing()
+    setTasks([...getQueue()])
+    setQueueSummary(getQueueSummary())
   }, [])
 
   const handleNotDuplicate = useCallback(
@@ -208,6 +268,17 @@ export function MaintenanceSection() {
       </div>
 
       <div className="space-y-3 rounded-lg border border-border/60 bg-muted/20 p-4">
+        <div className="flex items-center gap-2"><ListRestart className="h-4 w-4 text-muted-foreground" /><h3 className="text-sm font-semibold">{t("settings.sections.maintenance.projectData.title")}</h3></div>
+        <p className="text-xs text-muted-foreground">{t("settings.sections.maintenance.projectData.description")}</p>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" onClick={() => void handleRebuildIndex()} disabled={!project || projectToolBusy}>{t("settings.sections.maintenance.projectData.rebuild")}</Button>
+          <Button variant="outline" onClick={() => void handleExportProject()} disabled={!project || projectToolBusy}><Archive className="h-4 w-4" />{t("settings.sections.maintenance.projectData.export")}</Button>
+          <Button variant="outline" onClick={() => void handleImportProject()} disabled={projectToolBusy}>{t("settings.sections.maintenance.projectData.import")}</Button>
+        </div>
+        {projectToolStatus && <p className="text-xs text-muted-foreground">{projectToolStatus}</p>}
+      </div>
+
+      <div className="space-y-3 rounded-lg border border-border/60 bg-muted/20 p-4">
         <div className="flex items-center gap-2">
           <Wrench className="h-4 w-4 text-muted-foreground" />
           <h3 className="text-sm font-semibold">
@@ -278,6 +349,8 @@ export function MaintenanceSection() {
       <QueueOrphanList
         tasks={tasks}
         groups={groups}
+        restoredBacklogWaiting={queueSummary.restoredBacklogWaiting}
+        onResumeRestored={handleResumeRestoredQueue}
         onCancel={(id) => void handleCancel(id)}
         onRetry={(id) => void handleRetry(id)}
         pendingPositionByTaskId={pendingPositionByTaskId}
@@ -325,6 +398,8 @@ function useRefInit<T>(init: () => T): { current: T } {
 interface QueueOrphanListProps {
   tasks: readonly DedupTask[]
   groups: GroupUiEntry[]
+  restoredBacklogWaiting: boolean
+  onResumeRestored: () => void
   onCancel: (taskId: string) => void
   onRetry: (taskId: string) => void
   pendingPositionByTaskId: Map<string, number>
@@ -340,6 +415,8 @@ interface QueueOrphanListProps {
 function QueueOrphanList({
   tasks,
   groups,
+  restoredBacklogWaiting,
+  onResumeRestored,
   onCancel,
   onRetry,
   pendingPositionByTaskId,
@@ -366,6 +443,22 @@ function QueueOrphanList({
             "Tasks queued from a previous scan that haven't finished yet. Merges run one at a time.",
         })}
       </p>
+      {restoredBacklogWaiting && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs">
+          <span className="text-amber-800 dark:text-amber-300">
+            {t("settings.sections.maintenance.dedup.restoredBacklog", {
+              defaultValue:
+                "These merge tasks were restored from the previous session and are paused to avoid unexpected LLM usage.",
+            })}
+          </span>
+          <Button size="sm" variant="secondary" onClick={onResumeRestored}>
+            <RotateCcw className="h-3.5 w-3.5" />
+            {t("settings.sections.maintenance.dedup.resumeRestored", {
+              defaultValue: "Resume merges",
+            })}
+          </Button>
+        </div>
+      )}
       {orphans.map((task) => (
         <div
           key={task.id}

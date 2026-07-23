@@ -30,6 +30,21 @@ describe("sanitizeIngestedFileContent", () => {
     expect(sanitizeIngestedFileContent(input)).toBe("---\ntype: x\n---\nbody")
   })
 
+  it("strips a ```yaml fence wrapping only the frontmatter", () => {
+    const input = "```yaml\n---\ntype: x\n---\n```\n\n# Body"
+    expect(sanitizeIngestedFileContent(input)).toBe("---\ntype: x\n---\n\n# Body")
+  })
+
+  it("strips a frontmatter fence after leading blank lines with a case-insensitive label", () => {
+    const input = "\n  \n```YAML\n---\ntype: x\n---\n```\n# Body"
+    expect(sanitizeIngestedFileContent(input)).toBe("---\ntype: x\n---\n# Body")
+  })
+
+  it("strips a CRLF fence around empty frontmatter", () => {
+    const input = "```yaml\r\n---\r\n---\r\n```\r\n\r\n# Body"
+    expect(sanitizeIngestedFileContent(input)).toBe("---\r\n---\r\n\r\n# Body")
+  })
+
   it("does NOT strip a non-fence-wrapped document containing a fenced code block in the body", () => {
     const input =
       "---\ntype: x\n---\n\n# Heading\n\n```js\nconsole.log('hi')\n```\n\nmore body"
@@ -51,6 +66,19 @@ describe("sanitizeIngestedFileContent", () => {
     )
   })
 
+  it("repairs a missing opening frontmatter fence when the closing fence is present", () => {
+    const input =
+      "\n\ntype: entity\ntitle: \"Foo: Bar\"\nsources: [foo.pdf]\n---\n\n# Foo\n\nBody"
+    expect(sanitizeIngestedFileContent(input)).toBe(
+      "---\ntype: entity\ntitle: \"Foo: Bar\"\nsources: [foo.pdf]\n---\n\n# Foo\n\nBody",
+    )
+  })
+
+  it("does NOT invent frontmatter when a body line only looks like metadata", () => {
+    const input = "title: A research question\n\n# Notes\n\nBody"
+    expect(sanitizeIngestedFileContent(input)).toBe(input)
+  })
+
   it("does NOT strip the word `frontmatter:` when it appears mid-document (in prose)", () => {
     const input = "---\ntype: x\n---\n\nThe frontmatter: of this doc is above."
     expect(sanitizeIngestedFileContent(input)).toBe(input)
@@ -61,6 +89,13 @@ describe("sanitizeIngestedFileContent", () => {
       "---\ntype: entity\nrelated: [[a]], [[b]], [[c]]\n---\n\nbody"
     expect(sanitizeIngestedFileContent(input)).toBe(
       `---\ntype: entity\nrelated: ["[[a]]", "[[b]]", "[[c]]"]\n---\n\nbody`,
+    )
+  })
+
+  it("repairs a wikilink list without corrupting CRLF frontmatter", () => {
+    const input = "---\r\ntype: entity\r\nrelated: [[a]], [[b]]\r\n---\r\n# Body\r\n"
+    expect(sanitizeIngestedFileContent(input)).toBe(
+      "---\r\ntype: entity\r\nrelated: [\"[[a]]\", \"[[b]]\"]\r\n---\r\n# Body\r\n",
     )
   })
 

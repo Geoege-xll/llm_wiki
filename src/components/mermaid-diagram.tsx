@@ -1,20 +1,32 @@
 import { Children, isValidElement, useEffect, useRef, useState, type ReactNode } from "react"
-import { X, ZoomIn } from "lucide-react"
+import { AlertTriangle, X, ZoomIn } from "lucide-react"
+import { useTranslation } from "react-i18next"
 
 interface MermaidDiagramProps {
   code: string
 }
 
+const svgCache = new Map<string, string>()
+
 export function MermaidDiagram({ code }: MermaidDiagramProps) {
+  const { t } = useTranslation()
   const containerRef = useRef<HTMLDivElement>(null)
   const [error, setError] = useState<string | null>(null)
-  const [svg, setSvg] = useState<string | null>(null)
-  const [visible, setVisible] = useState(false)
+  const [svg, setSvg] = useState<string | null>(() => svgCache.get(code) ?? null)
+  const [visible, setVisible] = useState(() => svgCache.has(code))
   const [expanded, setExpanded] = useState(false)
   const [scale, setScale] = useState(1)
 
+  useEffect(() => {
+    const cached = svgCache.get(code) ?? null
+    setError(null)
+    setSvg(cached)
+    setVisible(Boolean(cached))
+  }, [code])
+
   // Only render when the diagram scrolls into view
   useEffect(() => {
+    if (svgCache.has(code)) return
     const el = containerRef.current
     if (!el) return
 
@@ -33,7 +45,12 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
 
   // Render mermaid SVG once visible
   useEffect(() => {
-    if (!visible) return
+    if (!visible || svg) return
+    const cached = svgCache.get(code)
+    if (cached) {
+      setSvg(cached)
+      return
+    }
     let cancelled = false
 
     async function render() {
@@ -43,13 +60,31 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
           startOnLoad: false,
           theme: "default",
           securityLevel: "strict",
+          suppressErrorRendering: true,
+        })
+        mermaid.setParseErrorHandler(() => {
+          // The component owns Mermaid parse errors. Do not let Mermaid inject
+          // its default "Syntax error in text" block into the document body.
         })
 
         const id = `mermaid-${Math.random().toString(36).slice(2, 10)}`
-        const { svg: rendered } = await mermaid.render(id, code)
-        if (!cancelled) {
-          setSvg(rendered)
-          setError(null)
+        const renderHost = document.createElement("div")
+        renderHost.style.position = "absolute"
+        renderHost.style.left = "-10000px"
+        renderHost.style.top = "0"
+        renderHost.style.width = "1px"
+        renderHost.style.height = "1px"
+        renderHost.style.overflow = "hidden"
+        containerRef.current?.appendChild(renderHost)
+        try {
+          const { svg: rendered } = await mermaid.render(id, code, renderHost)
+          if (!cancelled) {
+            svgCache.set(code, rendered)
+            setSvg(rendered)
+            setError(null)
+          }
+        } finally {
+          renderHost.remove()
         }
       } catch (err) {
         if (!cancelled) {
@@ -61,7 +96,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
 
     render()
     return () => { cancelled = true }
-  }, [visible, code])
+  }, [visible, code, svg])
 
   // Prevent layout shift: compute a stable min-height from code line count
   const estimatedHeight = Math.max(80, code.split("\n").length * 20)
@@ -80,10 +115,24 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
   }, [expanded])
 
   if (error) {
+    const summary = summarizeMermaidError(error)
     return (
-      <div className="my-2 rounded border border-red-300/60 bg-red-50/50 dark:bg-red-950/20 p-2 text-xs text-red-700 dark:text-red-400">
-        <p className="font-medium mb-1">Mermaid syntax error</p>
-        <pre className="whitespace-pre-wrap text-[11px] opacity-70">{error}</pre>
+      <div className="my-2 max-w-full rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <div className="flex items-start gap-2">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">{t("mermaid.renderFailed")}</p>
+            <p className="mt-0.5 line-clamp-2 text-destructive/80">{summary}</p>
+            <details className="mt-1">
+              <summary className="cursor-pointer select-none text-[11px] text-destructive/70 hover:text-destructive">
+                {t("mermaid.showDetails")}
+              </summary>
+              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-background/70 p-2 text-[11px] text-muted-foreground">
+                {error}
+              </pre>
+            </details>
+          </div>
+        </div>
       </div>
     )
   }
@@ -101,7 +150,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
               type="button"
               onClick={() => setExpanded(true)}
               className="absolute top-2 right-2 z-10 rounded-md bg-background/80 px-1.5 py-1 text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground group-hover/diagram:opacity-100"
-              title="Enlarge diagram"
+              title={t("mermaid.enlarge")}
             >
               <ZoomIn className="h-4 w-4" />
             </button>
@@ -113,11 +162,11 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
           </>
         ) : visible ? (
           <div className="flex items-center justify-center h-full p-4">
-            <span className="text-xs text-muted-foreground animate-pulse">Rendering diagram...</span>
+            <span className="text-xs text-muted-foreground animate-pulse">{t("mermaid.rendering")}</span>
           </div>
         ) : (
           <div className="flex items-center justify-center h-full p-4">
-            <span className="text-xs text-muted-foreground/50">Diagram</span>
+            <span className="text-xs text-muted-foreground/50">{t("mermaid.diagram")}</span>
           </div>
         )}
       </div>
@@ -166,6 +215,18 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
       )}
     </>
   )
+}
+
+function summarizeMermaidError(error: string): string {
+  const normalized = error
+    .replace(/\s*mermaid version\s+[\d.]+/gi, "")
+    .replace(/\n{2,}/g, "\n")
+    .trim()
+  const firstUsefulLine = normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line && !/^error:/i.test(line))
+  return firstUsefulLine || "Check the diagram syntax in the Mermaid code block."
 }
 
 export function unwrapMermaidPre(children: ReactNode): ReactNode | null {

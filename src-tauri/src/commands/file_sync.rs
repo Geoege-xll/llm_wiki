@@ -200,7 +200,7 @@ pub fn start_project_file_watcher(
         let watcher_generation = WATCHER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         ensure_sync_dir(&root)?;
         with_queue_lock(&root, || reset_processing_tasks(&root, &project_id))?;
-        enqueue_rescan_changes(&root, &project_id, &source_watch_config)?;
+        enqueue_startup_rescan_changes(&root, &project_id, &source_watch_config)?;
         let changed_tasks = process_queue(Some(&app), &root, &project_id)?;
 
         let (tx, rx) = mpsc::sync_channel::<PathBuf>(8_192);
@@ -647,6 +647,19 @@ fn enqueue_rescan_changes(
     enqueue_paths(root, project_id, rels)
 }
 
+fn enqueue_startup_rescan_changes(
+    root: &Path,
+    project_id: &str,
+    source_watch_config: &SourceWatchConfig,
+) -> Result<(), String> {
+    enqueue_rescan_changes_for_prefixes(
+        root,
+        project_id,
+        &["raw/sources", "wiki", "purpose.md", "schema.md"],
+        source_watch_config,
+    )
+}
+
 fn enqueue_rescan_changes_for_prefixes(
     root: &Path,
     project_id: &str,
@@ -765,7 +778,7 @@ fn upsert_task(
     }) {
         task.kind = merge_kind(&task.kind, &kind);
         task.hash_after = new.as_ref().and_then(|m| m.hash.clone());
-        task.size = new.as_ref().map(|m| m.size);
+        task.size = new.as_ref().or(old.as_ref()).map(|m| m.size);
         task.mtime_ms = new.as_ref().map(|m| m.mtime_ms);
         task.updated_at = now;
         if task.status == FileChangeStatus::Failed {
@@ -790,9 +803,11 @@ fn upsert_task(
         path: rel.to_string(),
         kind,
         status: FileChangeStatus::Pending,
-        hash_before: old.and_then(|m| m.hash),
+        hash_before: old.as_ref().and_then(|m| m.hash.clone()),
         hash_after: new.as_ref().and_then(|m| m.hash.clone()),
-        size: new.as_ref().map(|m| m.size),
+        // Deleted tasks need the previous size so frontend rename detection
+        // can reject empty/tiny hash matches without disabling all moves.
+        size: new.as_ref().or(old.as_ref()).map(|m| m.size),
         mtime_ms: new.as_ref().map(|m| m.mtime_ms),
         created_at: now,
         updated_at: now,
@@ -1534,6 +1549,39 @@ mod tests {
     }
 
     #[test]
+    fn startup_rescan_scans_watch_roots_without_full_project_walk() {
+        let root = temp_root("startup-prefixes");
+        fs::create_dir_all(root.join("wiki/entities")).unwrap();
+        fs::create_dir_all(root.join("unwatched/deep")).unwrap();
+        fs::write(root.join("raw/sources/source.md"), "source").unwrap();
+        fs::write(
+            root.join("wiki/entities/topic.md"),
+            "---\ntitle: Topic\n---\n",
+        )
+        .unwrap();
+        fs::write(root.join("purpose.md"), "purpose").unwrap();
+        fs::write(root.join("schema.md"), "schema").unwrap();
+        fs::write(root.join("unwatched/deep/note.md"), "ignore").unwrap();
+
+        ensure_sync_dir(&root).unwrap();
+        enqueue_startup_rescan_changes(&root, "p1", &default_watch_config()).unwrap();
+        let queue = read_queue(&root).unwrap();
+        let paths = queue
+            .tasks
+            .iter()
+            .map(|task| task.path.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(paths.contains("raw/sources/source.md"));
+        assert!(paths.contains("wiki/entities/topic.md"));
+        assert!(paths.contains("purpose.md"));
+        assert!(paths.contains("schema.md"));
+        assert!(!paths.contains("unwatched/deep/note.md"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn app_written_paths_update_snapshot_without_queueing() {
         let root = temp_root("app-write");
         let rel = "raw/sources/a.md";
@@ -1606,6 +1654,28 @@ mod tests {
         assert_eq!(queue.tasks[0].retry_count, MAX_RETRY_COUNT);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deleted_task_keeps_previous_file_size_for_move_detection() {
+        let mut queue = FileChangeQueue::default();
+        let old = FileMeta {
+            hash: Some("same".into()),
+            size: 128,
+            mtime_ms: 1,
+        };
+        upsert_task(
+            &mut queue,
+            "p1",
+            "raw/sources/old.md",
+            FileChangeKind::Deleted,
+            Some(old),
+            None,
+            2,
+        );
+
+        assert_eq!(queue.tasks[0].size, Some(128));
+        assert_eq!(queue.tasks[0].hash_before.as_deref(), Some("same"));
     }
 
     #[test]

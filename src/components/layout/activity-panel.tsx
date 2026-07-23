@@ -2,8 +2,9 @@ import { useState, useEffect, useRef, useCallback } from "react"
 import {
   ChevronUp, ChevronDown, Loader2, CheckCircle2, AlertCircle,
   FileText, Users, Lightbulb, BookOpen, GitMerge, BarChart3, HelpCircle, Layout,
-  RotateCcw, X, Clock, TrendingUp, Target,
+  RotateCcw, X, Clock, TrendingUp, Target, Pause, Play,
 } from "lucide-react"
+import { useTranslation } from "react-i18next"
 import { useActivityStore, type ActivityItem } from "@/stores/activity-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useFileSyncStore } from "@/stores/file-sync-store"
@@ -15,6 +16,8 @@ import {
   retryAllFailedTasks,
   cancelTask,
   cancelAllTasks,
+  pauseProcessing,
+  resumeProcessing,
   type IngestTask,
 } from "@/lib/ingest-queue"
 import {
@@ -51,23 +54,24 @@ const WIKI_TYPE_ICON_KEYS: Record<string, keyof typeof FILE_TYPE_ICONS> = {
   overview: "overview",
 }
 
-function getFileTypeInfo(path: string): { icon: typeof FileText; type: string } {
+function getFileTypeInfo(path: string): { icon: typeof FileText; typeKey: string } {
   const inferred = inferWikiTypeFromPath(path)
   if (inferred) {
     const directoryIcon = FILE_TYPE_ICONS[WIKI_TYPE_ICON_KEYS[inferred]]
-    return { icon: directoryIcon ?? FileText, type: wikiTypeLabel(inferred) }
+    return { icon: directoryIcon ?? FileText, typeKey: inferred }
   }
   for (const [dir, icon] of Object.entries(FILE_TYPE_ICONS)) {
     if (path.includes(`/${dir}/`) || path.startsWith(`wiki/${dir}/`)) {
-      return { icon, type: dir.charAt(0).toUpperCase() + dir.slice(1, -1) }
+      return { icon, typeKey: dir.replace(/s$/, "") }
     }
   }
-  if (path.includes("index.md")) return { icon: Layout, type: "Index" }
-  if (path.includes("log.md")) return { icon: FileText, type: "Log" }
-  return { icon: FileText, type: "File" }
+  if (path.includes("index.md")) return { icon: Layout, typeKey: "index" }
+  if (path.includes("log.md")) return { icon: FileText, typeKey: "log" }
+  return { icon: FileText, typeKey: "file" }
 }
 
 export function ActivityPanel() {
+  const { t } = useTranslation()
   const items = useActivityStore((s) => s.items)
   const clearDone = useActivityStore((s) => s.clearDone)
   const project = useWikiStore((s) => s.project)
@@ -75,7 +79,7 @@ export function ActivityPanel() {
   const setFileSyncTasks = useFileSyncStore((s) => s.setTasks)
   const fileSyncError = useFileSyncStore((s) => s.lastError)
   const [expanded, setExpanded] = useState(false)
-  const [queueTasks, setQueueTasks] = useState<IngestTask[]>([])
+  const [queueTasks, setQueueTasks] = useState<IngestTask[]>(() => [...getQueue()])
   const prevRunningRef = useRef(0)
 
   const runningCount = items.filter((i) => i.status === "running").length
@@ -91,6 +95,9 @@ export function ActivityPanel() {
 
   const queueSummary = getQueueSummary()
   const hasQueue = queueSummary.total > 0
+  const shouldResumeQueue =
+    queueSummary.userPaused ||
+    (queueSummary.restoredBacklogWaiting && queueSummary.processing === 0)
   const hasFileSync = fileSyncTasks.length > 0 || Boolean(fileSyncError)
   const fileSyncPending = fileSyncTasks.filter((t) => t.status === "pending").length
   const fileSyncProcessing = fileSyncTasks.filter((t) => t.status === "processing").length
@@ -125,13 +132,18 @@ export function ActivityPanel() {
     if (!project) return
     const activeCount = queueSummary.pending + queueSummary.processing
     if (activeCount === 0) return
-    if (!window.confirm(
-      `Cancel all ${activeCount} queued/processing task${activeCount > 1 ? "s" : ""}? ` +
-      `Partial files from the in-progress task will be removed. ` +
-      `Failed tasks will be kept so you can retry them.`,
-    )) return
+    if (!window.confirm(t("activity.cancelAllConfirm", { count: activeCount }))) return
     cancelAllTasks()
-  }, [project, queueSummary.pending, queueSummary.processing])
+  }, [project, queueSummary.pending, queueSummary.processing, t])
+
+  const handleTogglePause = useCallback(() => {
+    if (!project) return
+    if (shouldResumeQueue) {
+      resumeProcessing()
+    } else {
+      pauseProcessing()
+    }
+  }, [project, shouldResumeQueue])
 
   const handleFileSyncRescan = useCallback(() => {
     if (!project) return
@@ -181,7 +193,7 @@ export function ActivityPanel() {
   // Build status text
   let statusText = ""
   if (queueSummary.processing > 0 || queueSummary.pending > 0) {
-    const done = queueSummary.total - queueSummary.pending - queueSummary.processing
+    const done = queueSummary.completed + queueSummary.failed
     statusText = `Queue: ${done}/${queueSummary.total}`
     if (queueSummary.failed > 0) statusText += ` (${queueSummary.failed} failed)`
   } else if (runningCount > 0) {
@@ -226,13 +238,13 @@ export function ActivityPanel() {
           {hasFileSync && (
             <div className="border-b border-border/50 px-3 py-1.5">
               <div className="mb-1 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
-                <span>File Sync</span>
+                <span>{t("activity.fileSync")}</span>
                 <button
                   onClick={handleFileSyncRescan}
                   className="rounded px-1.5 py-0.5 text-[10px] hover:bg-accent hover:text-foreground"
-                  title="Scan project files for external changes"
+                  title={t("activity.rescanTitle")}
                 >
-                  Rescan
+                  {t("activity.rescan")}
                 </button>
               </div>
               {fileSyncError && (
@@ -253,33 +265,58 @@ export function ActivityPanel() {
           {hasQueue && (queueSummary.processing > 0 || queueSummary.pending > 0) && (
             <div className="px-3 py-1.5 border-b border-border/50">
               <div className="flex items-center justify-between text-[10px] text-muted-foreground mb-1 gap-2">
-                <span>Ingest Queue</span>
-                <span className="flex-1 text-right">
-                  {queueSummary.total - queueSummary.pending - queueSummary.processing}/{queueSummary.total} complete
+                <span>
+                  {queueSummary.paused && queueSummary.processing === 0
+                    ? t("activity.ingestQueuePaused")
+                    : t("activity.ingestQueue")}
                 </span>
+                <span className="flex-1 text-right">
+                  {t("activity.queueCompleteCount", {
+                    done: queueSummary.completed + queueSummary.failed,
+                    total: queueSummary.total,
+                  })}
+                </span>
+                {(queueSummary.processing > 0 || queueSummary.pending > 0 || queueSummary.paused) && (
+                  <button
+                    onClick={handleTogglePause}
+                    className="flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] hover:bg-accent hover:text-foreground"
+                    title={
+                      shouldResumeQueue
+                        ? t("activity.resumeQueueTitle")
+                        : t("activity.pauseQueueTitle")
+                    }
+                  >
+                    {shouldResumeQueue
+                      ? <Play className="h-2.5 w-2.5" />
+                      : <Pause className="h-2.5 w-2.5" />}
+                    {shouldResumeQueue
+                      ? t("activity.resumeQueue")
+                      : t("activity.pauseQueue")}
+                  </button>
+                )}
                 {queueSummary.pending + queueSummary.processing >= 2 && (
                   <button
                     onClick={handleCancelAll}
                     className="rounded px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/10"
-                    title="Cancel all queued and in-progress tasks"
+                    title={t("activity.cancelAllTitle")}
                   >
-                    Cancel all
+                    {t("activity.cancelAll")}
                   </button>
                 )}
                 {queueSummary.failed > 0 && (
                   <button
                     onClick={handleRetryAllFailed}
                     className="rounded px-1.5 py-0.5 text-[10px] hover:bg-accent hover:text-foreground"
-                    title="Retry all failed ingest tasks"
+                    title={t("activity.retryFailedTitle")}
                   >
-                    Retry failed
+                    {t("activity.retryFailed")}
                   </button>
                 )}
               </div>
               <div className="h-1.5 rounded-full bg-muted overflow-hidden">
                 <div
                   className="h-full rounded-full bg-primary transition-all"
-                  style={{ width: `${((queueSummary.total - queueSummary.pending - queueSummary.processing) / Math.max(queueSummary.total, 1)) * 100}%` }}
+                  style={{ width: `${((queueSummary.completed + queueSummary.failed) / Math.max(queueSummary.total, 1)) * 100}%` }}
                 />
               </div>
             </div>
@@ -288,16 +325,16 @@ export function ActivityPanel() {
           {hasQueue && queueSummary.processing === 0 && queueSummary.pending === 0 && queueSummary.failed > 0 && (
             <div className="px-3 py-1.5 border-b border-border/50">
               <div className="flex items-center justify-between text-[10px] text-muted-foreground gap-2">
-                <span>Ingest Queue</span>
+                <span>{t("activity.ingestQueue")}</span>
                 <span className="flex-1 text-right">
-                  {queueSummary.failed} failed
+                  {t("activity.failedCount", { count: queueSummary.failed })}
                 </span>
                 <button
                   onClick={handleRetryAllFailed}
                   className="rounded px-1.5 py-0.5 text-[10px] hover:bg-accent hover:text-foreground"
-                  title="Retry all failed ingest tasks"
+                  title={t("activity.retryFailedTitle")}
                 >
-                  Retry failed
+                  {t("activity.retryFailed")}
                 </button>
               </div>
             </div>
@@ -333,7 +370,7 @@ export function ActivityPanel() {
               onClick={clearDone}
               className="w-full px-3 py-1 text-center text-[10px] text-muted-foreground hover:underline"
             >
-              Clear completed
+              {t("activity.clearCompleted")}
             </button>
           )}
         </div>
@@ -343,6 +380,7 @@ export function ActivityPanel() {
 }
 
 function QueueRow({ task, onRetry, onCancel }: { task: IngestTask; onRetry: (id: string) => void; onCancel: (id: string) => void }) {
+  const { t } = useTranslation()
   const fileName = getFileName(task.sourcePath)
 
   return (
@@ -367,7 +405,7 @@ function QueueRow({ task, onRetry, onCancel }: { task: IngestTask; onRetry: (id:
             <button
               onClick={() => onRetry(task.id)}
               className="p-0.5 rounded hover:bg-accent text-muted-foreground hover:text-foreground"
-              title="Retry"
+              title={t("common.retry")}
             >
               <RotateCcw className="h-3 w-3" />
             </button>
@@ -376,7 +414,7 @@ function QueueRow({ task, onRetry, onCancel }: { task: IngestTask; onRetry: (id:
             <button
               onClick={() => onCancel(task.id)}
               className="p-0.5 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
-              title="Cancel"
+              title={t("common.cancel")}
             >
               <X className="h-3 w-3" />
             </button>
@@ -388,8 +426,9 @@ function QueueRow({ task, onRetry, onCancel }: { task: IngestTask; onRetry: (id:
 }
 
 function FileSyncRow({ task, onRetry, onIgnore }: { task: FileChangeTask; onRetry: (id: string) => void; onIgnore: (id: string) => void }) {
+  const { t } = useTranslation()
   const fileName = getFileName(task.path)
-  const kindLabel = task.kind.charAt(0).toUpperCase() + task.kind.slice(1)
+  const kindLabel = t(`activity.changeKinds.${task.kind}`, { defaultValue: task.kind })
 
   return (
     <div className="py-1.5 text-xs">
@@ -411,14 +450,14 @@ function FileSyncRow({ task, onRetry, onIgnore }: { task: FileChangeTask; onRetr
             <button
               onClick={() => onRetry(task.id)}
               className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
-              title="Retry"
+              title={t("common.retry")}
             >
               <RotateCcw className="h-3 w-3" />
             </button>
             <button
               onClick={() => onIgnore(task.id)}
               className="rounded p-0.5 text-muted-foreground hover:bg-destructive/20 hover:text-destructive"
-              title="Ignore"
+              title={t("common.ignore")}
             >
               <X className="h-3 w-3" />
             </button>
@@ -430,7 +469,8 @@ function FileSyncRow({ task, onRetry, onIgnore }: { task: FileChangeTask; onRetr
 }
 
 function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => void }) {
-  const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
+  const { t } = useTranslation()
+  const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
   const project = useWikiStore((s) => s.project)
 
   function handleFileClick(filePath: string) {
@@ -439,7 +479,7 @@ function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => 
     const fullPath = isAbsolutePath(filePath)
       ? normalizePath(filePath)
       : `${pp}/${filePath}`
-    setSelectedFile(fullPath)
+    openPathInPreview(fullPath)
   }
 
   return (
@@ -458,7 +498,7 @@ function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => 
           <button
             onClick={onCancel}
             className="shrink-0 p-0.5 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
-            title="Cancel"
+            title={t("common.cancel")}
           >
             <X className="h-3 w-3" />
           </button>
@@ -469,7 +509,7 @@ function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => 
       {item.filesWritten.length > 0 && item.status === "done" && (
         <div className="mt-1.5 ml-5 flex flex-col gap-0.5">
           {item.filesWritten.map((filePath) => {
-            const { icon: Icon, type } = getFileTypeInfo(filePath)
+            const { icon: Icon, typeKey } = getFileTypeInfo(filePath)
             const fileName = getFileName(filePath)
             return (
               <button
@@ -479,7 +519,9 @@ function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => 
                 className="flex items-center gap-1.5 rounded px-1 py-0.5 text-left text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors"
               >
                 <Icon className="h-3 w-3 shrink-0" />
-                <span className="text-[10px] font-medium text-muted-foreground/70 w-14 shrink-0">{type}</span>
+                <span className="text-[10px] font-medium text-muted-foreground/70 w-14 shrink-0">
+                  {t(`activity.fileTypes.${typeKey}`, { defaultValue: wikiTypeLabel(typeKey) })}
+                </span>
                 <span className="truncate">{fileName}</span>
               </button>
             )

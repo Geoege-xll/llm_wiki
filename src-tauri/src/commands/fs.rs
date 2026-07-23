@@ -5,13 +5,14 @@ use std::thread;
 use std::time::Duration;
 
 use calamine::{open_workbook_auto, Data, Reader};
+use office_oxide::Document;
 
 use crate::commands::file_sync;
 use crate::panic_guard::run_guarded;
 use crate::types::wiki::FileNode;
 
 /// Known binary formats that need special extraction
-const OFFICE_EXTS: &[&str] = &["docx", "pptx", "xlsx", "odt", "ods", "odp"];
+const OFFICE_EXTS: &[&str] = &["doc", "docx", "pptx", "xls", "xlsx", "odt", "ods", "odp"];
 const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "avif", "heic", "heif", "svg",
 ];
@@ -19,10 +20,42 @@ const MEDIA_EXTS: &[&str] = &[
     "mp4", "webm", "mov", "avi", "mkv", "flv", "wmv", "m4v", "mp3", "wav", "ogg", "flac", "aac",
     "m4a", "wma",
 ];
-const LEGACY_DOC_EXTS: &[&str] = &["doc", "xls", "ppt", "pages", "numbers", "key", "epub"];
+const EBOOK_EXTS: &[&str] = &["epub", "mobi"];
+const LEGACY_DOC_EXTS: &[&str] = &["ppt", "pages", "numbers", "key"];
+
+fn require_absolute_path(operation: &str, path: &str) -> Result<(), String> {
+    if is_absolute_path_cross_platform(path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{operation} requires an absolute path; got relative path '{}'",
+            path
+        ))
+    }
+}
+
+fn is_absolute_path_cross_platform(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if Path::new(path).is_absolute() {
+        return true;
+    }
+
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[1] == b':'
+        && bytes[0].is_ascii_alphabetic()
+        && matches!(bytes[2], b'/' | b'\\')
+    {
+        return true;
+    }
+
+    path.starts_with(r"\\") || path.starts_with("//")
+}
 
 #[tauri::command]
-pub async fn read_file(path: String) -> Result<String, String> {
+pub async fn read_file(path: String, extract_images: Option<bool>) -> Result<String, String> {
     // `spawn_blocking` is REQUIRED, not a perf nicety. The body does
     // synchronous PDF/Office text extraction (pdfium FFI, calamine,
     // zip + image decode) that can take 10s+ on big files. Running
@@ -45,9 +78,13 @@ pub async fn read_file(path: String) -> Result<String, String> {
                 return Ok(cached);
             }
 
+            let include_images = extract_images.unwrap_or(true);
+
             match ext.as_str() {
-                "pdf" => extract_pdf_text(&path),
+                "pdf" => extract_pdf_text(&path, include_images),
+                "org" => extract_org_text(&path),
                 e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e),
+                e if EBOOK_EXTS.contains(&e) => crate::commands::ebook::extract_ebook_text(&path, e),
                 e if IMAGE_EXTS.contains(&e) => {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     Ok(format!("[Image: {} ({:.1} KB)]", p.file_name().unwrap_or_default().to_string_lossy(), size as f64 / 1024.0))
@@ -97,8 +134,12 @@ pub async fn preprocess_file(path: String) -> Result<String, String> {
                 .to_lowercase();
 
             let text = match ext.as_str() {
-                "pdf" => extract_pdf_text(&path)?,
+                "pdf" => extract_pdf_text(&path, false)?,
+                "org" => extract_org_text(&path)?,
                 e if OFFICE_EXTS.contains(&e) => extract_office_text(&path, e)?,
+                e if EBOOK_EXTS.contains(&e) => {
+                    crate::commands::ebook::extract_ebook_text(&path, e)?
+                }
                 _ => return Ok("no preprocessing needed".to_string()),
             };
 
@@ -128,6 +169,16 @@ fn read_cache(original: &Path) -> Option<String> {
     }
 }
 
+/// Return a fresh preprocessing cache for Agent source retrieval.
+///
+/// Binary imports remain the referenced source of record; this helper only
+/// exposes their text extraction and never causes parsing or cache writes from
+/// a search request. Keeping freshness checks here also prevents the Agent
+/// from quoting a cache after the original file changed externally.
+pub(crate) fn read_preprocessed_cache(original: &Path) -> Option<String> {
+    read_cache(original)
+}
+
 fn write_cache(original: &Path, text: &str) -> Result<(), String> {
     let cache_path = cache_path_for(original);
     if let Some(parent) = cache_path.parent() {
@@ -135,6 +186,135 @@ fn write_cache(original: &Path, text: &str) -> Result<(), String> {
     }
     crate::commands::file_sync::mark_app_write_path(&cache_path);
     fs::write(&cache_path, text).map_err(|e| format!("Failed to write cache: {}", e))
+}
+
+/// Convert common Org syntax into Markdown-shaped text for ingestion and
+/// preview. The original `.org` file remains untouched in `raw/sources`.
+/// Source blocks are copied verbatim inside fences and are never executed.
+fn extract_org_text(path: &str) -> Result<String, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read Org file '{}': {}", path, e))?;
+    Ok(org_to_markdown(&content))
+}
+
+fn org_to_markdown(content: &str) -> String {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    let mut output = Vec::new();
+    let mut block_end: Option<&'static str> = None;
+
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if let Some(end) = block_end {
+            if upper == end {
+                output.push("```".to_string());
+                block_end = None;
+            } else {
+                output.push(line.to_string());
+            }
+            continue;
+        }
+
+        if upper.starts_with("#+BEGIN_SRC") {
+            let language = trimmed[11..].trim().split_whitespace().next().unwrap_or("");
+            output.push(format!("```{language}"));
+            block_end = Some("#+END_SRC");
+            continue;
+        }
+        if upper == "#+BEGIN_EXAMPLE" {
+            output.push("```text".to_string());
+            block_end = Some("#+END_EXAMPLE");
+            continue;
+        }
+        if upper == "#+BEGIN_QUOTE" {
+            output.push("```text".to_string());
+            block_end = Some("#+END_QUOTE");
+            continue;
+        }
+
+        if let Some((key, value)) = parse_org_keyword(trimmed) {
+            if key == "TITLE" {
+                output.push(format!("# {value}"));
+            } else if !matches!(key.as_str(), "OPTIONS" | "PROPERTY" | "SETUPFILE") {
+                output.push(format!("**{}:** {}", title_case_ascii(&key), value));
+            }
+            continue;
+        }
+
+        if let Some((level, heading)) = parse_org_heading(line) {
+            output.push(format!(
+                "{} {}",
+                "#".repeat(level.min(6)),
+                convert_org_links(heading)
+            ));
+            continue;
+        }
+
+        if trimmed.starts_with('|')
+            && trimmed.ends_with('|')
+            && trimmed.contains('+')
+            && trimmed
+                .chars()
+                .all(|c| matches!(c, '|' | '+' | '-' | ':' | ' '))
+        {
+            output.push(trimmed.replace('+', "|"));
+            continue;
+        }
+
+        output.push(convert_org_links(line));
+    }
+    if block_end.is_some() {
+        output.push("```".to_string());
+    }
+    output.join("\n")
+}
+
+fn parse_org_keyword(line: &str) -> Option<(String, &str)> {
+    let rest = line.strip_prefix("#+")?;
+    let (key, value) = rest.split_once(':')?;
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((key.to_ascii_uppercase(), value.trim()))
+}
+
+fn parse_org_heading(line: &str) -> Option<(usize, &str)> {
+    let stars = line.chars().take_while(|c| *c == '*').count();
+    if stars == 0 || line.as_bytes().get(stars) != Some(&b' ') {
+        return None;
+    }
+    Some((stars, line[stars + 1..].trim()))
+}
+
+fn title_case_ascii(value: &str) -> String {
+    let lower = value.replace('_', " ").to_ascii_lowercase();
+    let mut chars = lower.chars();
+    chars
+        .next()
+        .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
+        .unwrap_or_default()
+}
+
+fn convert_org_links(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find("[[") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let inner = &after[..end];
+        if let Some((target, description)) = inner.split_once("][") {
+            out.push_str(&format!("[{}]({})", description, target));
+        } else {
+            out.push_str(&format!("<{}>", inner));
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Global PDFium instance — the library prefers a single binding shared
@@ -316,69 +496,51 @@ pub(crate) fn pdfium() -> Result<&'static pdfium_render::prelude::Pdfium, String
         .map_err(|e| e.clone())
 }
 
-/// Extract a PDF as markdown — text + per-page image references
-/// when the file lives under a project's `raw/sources/` (the
-/// layout the import pipeline produces). Falls back to text-only
-/// when the PDF is opened from anywhere else.
-///
-/// Layout heuristic: a PDF at `<project>/raw/sources/<name>.pdf`
-/// implies project root = `<project>` and image dest =
-/// `<project>/wiki/media/<name>/`. We use absolute filesystem paths
-/// in the emitted `![](url)` references so the markdown previews
-/// (raw-source view AND wiki-summary view) both render via
-/// `convertFileSrc` without anyone having to know which directory
-/// they're rendering from.
+/// Extract a PDF as markdown. When `include_images` is true and the PDF
+/// is opened directly from `<project>/raw/sources`, this also writes
+/// preview images to `<project>/wiki/media/<file-stem>/` and emits image
+/// markdown. Ingest passes `include_images=false` and owns image
+/// extraction through the canonical source-identity slug, preventing a
+/// duplicate `<file-stem>` media folder for nested sources.
 ///
 /// Lock: delegates to `extract_pdf_markdown`, which acquires the
 /// pdfium lock internally. We must NOT take it here too —
 /// `std::sync::Mutex` is non-reentrant.
-fn extract_pdf_text(path: &str) -> Result<String, String> {
+fn extract_pdf_text(path: &str, include_images: bool) -> Result<String, String> {
     use crate::commands::extract_images::{extract_pdf_markdown, ExtractOptions};
 
-    let p = Path::new(path);
-    let parent = p.parent();
-    let stem = p
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+    if include_images {
+        let p = Path::new(path);
+        let parent = p.parent();
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
 
-    // The path-component check uses `ends_with` on `Path` which
-    // matches the LAST component (not a string-suffix check), so
-    // `/foo/raw/sources/bar.pdf` correctly identifies as under
-    // `raw/sources/` while `/foo/braw/source-thing/bar.pdf` does
-    // not.
-    let parent_is_sources = parent.map(|d| d.ends_with("sources")).unwrap_or(false);
-    let raw_dir = parent.and_then(|d| d.parent());
-    let raw_is_raw = raw_dir.map(|d| d.ends_with("raw")).unwrap_or(false);
-    let project_root = if parent_is_sources && raw_is_raw {
-        raw_dir.and_then(|d| d.parent())
-    } else {
-        None
-    };
+        let parent_is_sources = parent.map(|d| d.ends_with("sources")).unwrap_or(false);
+        let raw_dir = parent.and_then(|d| d.parent());
+        let raw_is_raw = raw_dir.map(|d| d.ends_with("raw")).unwrap_or(false);
+        let project_root = if parent_is_sources && raw_is_raw {
+            raw_dir.and_then(|d| d.parent())
+        } else {
+            None
+        };
 
-    if let Some(root) = project_root {
-        if !stem.is_empty() {
-            let media_dir = root.join("wiki").join("media").join(&stem);
-            // Forward-slash absolute path so we don't ship `\` into
-            // markdown that the JS-side resolver would then have to
-            // re-normalize. The resolver does handle backslashes,
-            // but emitting clean URLs in the first place avoids
-            // surprises in cache files we save to disk.
-            let url_prefix = media_dir.to_string_lossy().replace('\\', "/");
-            return extract_pdf_markdown(
-                path,
-                Some(&media_dir),
-                &url_prefix,
-                &ExtractOptions::default(),
-            );
+        if let Some(root) = project_root {
+            if !stem.is_empty() {
+                let media_dir = root.join("wiki").join("media").join(&stem);
+                let url_prefix = media_dir.to_string_lossy().replace('\\', "/");
+                return extract_pdf_markdown(
+                    path,
+                    Some(&media_dir),
+                    &url_prefix,
+                    &ExtractOptions::default(),
+                );
+            }
         }
     }
 
-    // PDFs not under <project>/raw/sources/ — text-only fallback.
-    // Skip the image side of the extraction entirely (no media
-    // destination → extract_pdf_markdown only writes text + page
-    // headers, no pdfium image-object enumeration).
     extract_pdf_markdown(path, None, "", &ExtractOptions::default())
 }
 
@@ -394,6 +556,11 @@ fn extract_office_text(path: &str, ext: &str) -> Result<String, String> {
         return extract_docx_with_library(path);
     }
 
+    // DOC: use office_oxide for legacy Word binary documents.
+    if ext == "doc" {
+        return extract_doc_with_office_oxide(path);
+    }
+
     // PPTX and ODF: use ZIP-based parsing
     let file = fs::File::open(path).map_err(|e| format!("Failed to open '{}': {}", path, e))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -403,6 +570,23 @@ fn extract_office_text(path: &str, ext: &str) -> Result<String, String> {
         "pptx" => extract_pptx_markdown(&mut archive),
         "odt" | "odp" => extract_odf_text(&mut archive),
         _ => Ok("[Unsupported format]".to_string()),
+    }
+}
+
+/// Extract legacy Word `.doc` text using office_oxide.
+fn extract_doc_with_office_oxide(path: &str) -> Result<String, String> {
+    let doc = Document::open(path).map_err(|e| format!("Failed to parse DOC '{}': {}", path, e))?;
+    let markdown = doc.to_markdown();
+    let text = if markdown.trim().is_empty() {
+        doc.plain_text()
+    } else {
+        markdown
+    };
+
+    if text.trim().is_empty() {
+        Ok("[Document: no extractable text found in .doc file]".to_string())
+    } else {
+        Ok(text)
     }
 }
 
@@ -815,12 +999,6 @@ fn extract_pptx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
     }
 }
 
-/// Extract XLSX/XLS/ODS to Markdown tables using calamine.
-fn extract_xlsx_markdown(_archive: &mut zip::ZipArchive<fs::File>) -> Result<String, String> {
-    // calamine needs the file path, not the archive
-    Err("Use extract_spreadsheet instead".to_string())
-}
-
 /// Extract spreadsheet to Markdown using calamine (supports xlsx, xls, ods).
 fn extract_spreadsheet(path: &str) -> Result<String, String> {
     let mut workbook = open_workbook_auto(path)
@@ -940,14 +1118,21 @@ fn extract_odf_text(archive: &mut zip::ZipArchive<fs::File>) -> Result<String, S
 pub async fn write_file(path: String, contents: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("write_file", || {
+            require_absolute_path("write_file", &path)?;
             let p = Path::new(&path);
             if let Some(parent) = p.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path, e))?;
             }
             file_sync::mark_app_write_path(p);
+            crate::commands::file_history::record_file_version(
+                p,
+                "baseline",
+                "before.ui.write_file",
+            );
             fs::write(&path, contents)
                 .map_err(|e| format!("Failed to write file '{}': {}", path, e))?;
+            crate::commands::file_history::record_file_version(p, "human", "ui.write_file");
             file_sync::mark_app_write_path(p);
             Ok(())
         })
@@ -957,9 +1142,36 @@ pub async fn write_file(path: String, contents: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn write_file_base64(path: String, base64: String) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("write_file_base64", || {
+            require_absolute_path("write_file_base64", &path)?;
+            let bytes = B64
+                .decode(base64.as_bytes())
+                .map_err(|e| format!("Invalid base64 for '{}': {}", path, e))?;
+            let p = Path::new(&path);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path, e))?;
+            }
+            file_sync::mark_app_write_path(p);
+            fs::write(&path, bytes)
+                .map_err(|e| format!("Failed to write binary file '{}': {}", path, e))?;
+            file_sync::mark_app_write_path(p);
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| format!("write_file_base64 blocking task join error: {e}"))?
+}
+
+#[tauri::command]
 pub async fn write_file_atomic(path: String, contents: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("write_file_atomic", || {
+            require_absolute_path("write_file_atomic", &path)?;
             let p = Path::new(&path);
             if let Some(parent) = p.parent() {
                 fs::create_dir_all(parent)
@@ -979,6 +1191,11 @@ pub async fn write_file_atomic(path: String, contents: String) -> Result<(), Str
 
             file_sync::mark_app_write_path(&tmp_path);
             file_sync::mark_app_write_path(p);
+            crate::commands::file_history::record_file_version(
+                p,
+                "baseline",
+                "before.ui.write_file_atomic",
+            );
             fs::write(&tmp_path, contents).map_err(|e| {
                 format!("Failed to write temp file '{}': {}", tmp_path.display(), e)
             })?;
@@ -992,6 +1209,7 @@ pub async fn write_file_atomic(path: String, contents: String) -> Result<(), Str
                     e
                 )
             })?;
+            crate::commands::file_history::record_file_version(p, "human", "ui.write_file_atomic");
             file_sync::mark_app_write_path(p);
             Ok(())
         })
@@ -1000,8 +1218,235 @@ pub async fn write_file_atomic(path: String, contents: String) -> Result<(), Str
     .map_err(|e| format!("write_file_atomic blocking task join error: {e}"))?
 }
 
+fn apply_text_selection_edit_inner(
+    project_path: &str,
+    file_path: &str,
+    prefix: &str,
+    selected_text: &str,
+    suffix: &str,
+    replacement: &str,
+) -> Result<String, String> {
+    let project = fs::canonicalize(project_path)
+        .map_err(|err| format!("Failed to resolve project path: {err}"))?;
+    let file = fs::canonicalize(file_path)
+        .map_err(|err| format!("Failed to resolve selected file: {err}"))?;
+    if !file.starts_with(&project) || !file.is_file() {
+        return Err(
+            "Selection edit target must be an existing file inside the project".to_string(),
+        );
+    }
+    let current = fs::read_to_string(&file)
+        .map_err(|err| format!("Failed to read selection edit target: {err}"))?;
+    let expected = format!("{prefix}{selected_text}{suffix}");
+    if current != expected {
+        return Err(
+            "The file changed after the selection was captured. Re-select the text before applying the Agent suggestion."
+                .to_string(),
+        );
+    }
+    let updated = format!("{prefix}{replacement}{suffix}");
+    file_sync::mark_app_write_path(&file);
+    crate::commands::file_history::record_file_version(
+        &file,
+        "baseline",
+        "before.agent.selection_edit",
+    );
+    fs::write(&file, &updated)
+        .map_err(|err| format!("Failed to apply Agent selection edit: {err}"))?;
+    crate::commands::file_history::record_file_version(&file, "agent", "agent.selection_edit");
+    file_sync::mark_app_write_path(&file);
+    Ok(updated)
+}
+
+/// Apply one Agent-proposed replacement without overwriting intervening user
+/// edits. The full prefix/selection/suffix snapshot is intentionally checked at
+/// the Rust write boundary; a frontend-only check would leave a TOCTOU window.
 #[tauri::command]
-pub async fn list_directory(path: String) -> Result<Vec<FileNode>, String> {
+pub async fn apply_text_selection_edit(
+    project_path: String,
+    file_path: String,
+    prefix: String,
+    selected_text: String,
+    suffix: String,
+    replacement: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("apply_text_selection_edit", || {
+            apply_text_selection_edit_inner(
+                &project_path,
+                &file_path,
+                &prefix,
+                &selected_text,
+                &suffix,
+                &replacement,
+            )
+        })
+    })
+    .await
+    .map_err(|err| format!("apply_text_selection_edit blocking task join error: {err}"))?
+}
+
+fn create_missing_wiki_page_inner(
+    project_path: &str,
+    title: &str,
+    content: Option<&str>,
+) -> Result<String, String> {
+    let project = fs::canonicalize(project_path)
+        .map_err(|err| format!("Failed to resolve project path: {err}"))?;
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 200 {
+        return Err("Missing-link page title must contain 1 to 200 characters".to_string());
+    }
+    let normalized_title = title
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let title = normalized_title.trim();
+    if content.is_some_and(|value| value.len() > 2 * 1024 * 1024) {
+        return Err("Missing-link page content exceeds the 2 MB limit".to_string());
+    }
+    let wiki_root = project.join("wiki");
+    let canonical_wiki = fs::canonicalize(&wiki_root)
+        .map_err(|err| format!("Failed to resolve wiki directory: {err}"))?;
+    if !canonical_wiki.starts_with(&project) {
+        return Err("Wiki directory escapes the project boundary".to_string());
+    }
+    let directory = canonical_wiki.join("concepts");
+    fs::create_dir_all(&directory)
+        .map_err(|err| format!("Failed to create wiki concepts directory: {err}"))?;
+    let canonical_directory = fs::canonicalize(&directory)
+        .map_err(|err| format!("Failed to resolve wiki concepts directory: {err}"))?;
+    if !canonical_directory.starts_with(&project) {
+        return Err("Wiki concepts directory escapes the project boundary".to_string());
+    }
+    let base = safe_missing_page_stem(title);
+    let mut target = canonical_directory.join(format!("{base}.md"));
+    for suffix in 2..=9999 {
+        if !target.exists() {
+            break;
+        }
+        target = canonical_directory.join(format!("{base}-{suffix}.md"));
+    }
+    if target.exists() {
+        return Err("Could not allocate a unique wiki page filename".to_string());
+    }
+    let today = chrono::Utc::now().format("%Y-%m-%d");
+    let escaped_title = title.replace('"', "\\\"");
+    let default_content = format!(
+        "---\ntype: concept\ntitle: \"{escaped_title}\"\ncreated: {today}\nupdated: {today}\ntags: []\nrelated: []\n---\n\n# {title}\n"
+    );
+    let body = content
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&default_content);
+    file_sync::mark_app_write_path(&target);
+    use std::io::Write as _;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|err| format!("Failed to reserve missing-link page: {err}"))?;
+    if let Err(err) = output.write_all(body.as_bytes()) {
+        drop(output);
+        let _ = fs::remove_file(&target);
+        return Err(format!("Failed to create missing-link page: {err}"));
+    }
+    crate::commands::file_history::record_file_version(
+        &target,
+        "agent",
+        "wiki.missing_link.create",
+    );
+    file_sync::mark_app_write_path(&target);
+    target
+        .strip_prefix(&project)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .map_err(|_| "Created page escaped the project boundary".to_string())
+}
+
+fn safe_missing_page_stem(title: &str) -> String {
+    let mut stem = title
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '-'
+            } else if character.is_whitespace() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    while stem.contains("--") {
+        stem = stem.replace("--", "-");
+    }
+    stem = stem.trim_matches([' ', '.', '-']).to_string();
+    if stem.is_empty() {
+        stem = "untitled".to_string();
+    }
+    let device = stem
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (device.len() == 4
+            && (device.starts_with("COM") || device.starts_with("LPT"))
+            && device.as_bytes()[3].is_ascii_digit()
+            && device.as_bytes()[3] != b'0')
+    {
+        stem = format!("page-{stem}");
+    }
+    stem.chars().take(120).collect()
+}
+
+/// Create a page for an unresolved wikilink. Filename allocation and the final
+/// write stay in Rust so UI callers cannot escape the project or overwrite an
+/// existing page, including through Windows device names or illegal characters.
+#[tauri::command]
+pub async fn create_missing_wiki_page(
+    project_path: String,
+    title: String,
+    content: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("create_missing_wiki_page", || {
+            create_missing_wiki_page_inner(&project_path, &title, content.as_deref())
+        })
+    })
+    .await
+    .map_err(|err| format!("create_missing_wiki_page blocking task join error: {err}"))?
+}
+
+/// Whether a directory entry should appear in a listing.
+///
+/// Hidden (dot-prefixed) entries are shown only when `include_hidden`
+/// is set. That flag is reserved for the `raw/sources` content area,
+/// where dotfolders like `.claude` / `.codex` are legitimate sources
+/// the user deliberately added. Every other caller keeps hiding dot
+/// entries so internal state (`.llm-wiki`, `.git`), caches, and secrets
+/// (`.env`) never leak into trees or the ingest candidate set.
+fn entry_is_visible(name: &str, include_hidden: bool) -> bool {
+    include_hidden || !name.starts_with('.')
+}
+
+#[tauri::command]
+pub async fn list_directory(
+    path: String,
+    include_hidden: Option<bool>,
+    max_depth: Option<usize>,
+) -> Result<Vec<FileNode>, String> {
+    let include_hidden = include_hidden.unwrap_or(false);
+    let max_depth = max_depth.unwrap_or(30).clamp(1, 30);
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("list_directory", || {
             let p = Path::new(&path);
@@ -1011,7 +1456,7 @@ pub async fn list_directory(path: String) -> Result<Vec<FileNode>, String> {
             if !p.is_dir() {
                 return Err(format!("Path is not a directory: '{}'", path));
             }
-            let nodes = build_tree(p, 0, 30)?;
+            let nodes = build_tree(p, 0, max_depth, include_hidden)?;
             Ok(nodes)
         })
     })
@@ -1019,7 +1464,12 @@ pub async fn list_directory(path: String) -> Result<Vec<FileNode>, String> {
     .map_err(|e| format!("list_directory blocking task join error: {e}"))?
 }
 
-fn build_tree(dir: &Path, depth: usize, max_depth: usize) -> Result<Vec<FileNode>, String> {
+fn build_tree(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    include_hidden: bool,
+) -> Result<Vec<FileNode>, String> {
     if depth >= max_depth {
         return Ok(vec![]);
     }
@@ -1028,11 +1478,10 @@ fn build_tree(dir: &Path, depth: usize, max_depth: usize) -> Result<Vec<FileNode
         .map_err(|e| format!("Failed to read directory '{}': {}", dir.display(), e))?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
-            // Skip dotfiles
             entry
                 .file_name()
                 .to_str()
-                .map(|n| !n.starts_with('.'))
+                .map(|n| entry_is_visible(n, include_hidden))
                 .unwrap_or(false)
         })
         .collect();
@@ -1061,7 +1510,7 @@ fn build_tree(dir: &Path, depth: usize, max_depth: usize) -> Result<Vec<FileNode
         let is_dir = entry_path.is_dir();
 
         let children = if is_dir {
-            let kids = build_tree(&entry_path, depth + 1, max_depth)?;
+            let kids = build_tree(&entry_path, depth + 1, max_depth, include_hidden)?;
             if kids.is_empty() {
                 None
             } else {
@@ -1364,6 +1813,7 @@ fn collect_related_pages(
 pub async fn create_directory(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         run_guarded("create_directory", || {
+            require_absolute_path("create_directory", &path)?;
             fs::create_dir_all(&path)
                 .map_err(|e| format!("Failed to create directory '{}': {}", path, e))
         })
@@ -1506,6 +1956,29 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn org_to_markdown_preserves_common_elements_without_executing_source_blocks() {
+        let input = "#+TITLE: Research Notes\r\n#+AUTHOR: Ada\r\n* TODO Topic :rust:notes:\r\nParagraph with [[https://example.com][reference]] and [[file:local.pdf]].\r\n- [ ] Verify\r\n| Name | Value |\r\n|------+-------|\r\n| A    | 1     |\r\n#+BEGIN_SRC sh\r\necho never-run\r\n#+END_SRC\r\n";
+        let output = org_to_markdown(input);
+        assert!(output.contains("# Research Notes"));
+        assert!(output.contains("**Author:** Ada"));
+        assert!(output.contains("# TODO Topic :rust:notes:"));
+        assert!(output.contains("[reference](https://example.com)"));
+        assert!(output.contains("<file:local.pdf>"));
+        assert!(output.contains("|------|-------|"));
+        assert!(output.contains("```sh\necho never-run\n```"));
+    }
+
+    #[test]
+    fn org_to_markdown_closes_unterminated_source_block_and_keeps_unknown_lines() {
+        let output = org_to_markdown(
+            "#+OPTIONS: toc:nil\n#+CUSTOM: kept\n* Heading\n#+BEGIN_SRC python\nprint('text only')",
+        );
+        assert!(!output.contains("OPTIONS"));
+        assert!(output.contains("**Custom:** kept"));
+        assert!(output.ends_with("```"));
+    }
+
     /// Write `bytes` to a fresh tmp path with `.pdf` suffix and return
     /// the path (the OS tmpdir is NOT cleaned up — acceptable for tests).
     fn tmp_pdf_with_bytes(bytes: &[u8]) -> String {
@@ -1551,7 +2024,7 @@ mod tests {
 
         for (name, bytes) in payloads {
             let path = tmp_pdf_with_bytes(bytes);
-            let result = read_file(path.clone()).await;
+            let result = read_file(path.clone(), None).await;
             let _ = fs::remove_file(&path);
             eprintln!(
                 "[{name}] => {:?}",
@@ -1566,8 +2039,58 @@ mod tests {
     /// through read_file's guarded path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_file_returns_err_on_missing_file_instead_of_panicking() {
-        let result = read_file("/nonexistent/path/that/does/not/exist.pdf".to_string()).await;
+        let result = read_file(
+            "/nonexistent/path/that/does/not/exist.pdf".to_string(),
+            None,
+        )
+        .await;
         assert!(result.is_err() || result.is_ok()); // must at least return
+    }
+
+    #[test]
+    fn extract_doc_with_office_oxide_handles_missing_file() {
+        let result = extract_doc_with_office_oxide("/nonexistent/path/that/does/not/exist.doc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to parse DOC"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_file_base64_writes_decoded_binary_bytes() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "llm-wiki-base64-{}.bin",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+
+        write_file_base64(path_str.clone(), "AAECA/8=".to_string())
+            .await
+            .unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(bytes, vec![0, 1, 2, 3, 255]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_file_base64_rejects_invalid_base64_and_relative_paths() {
+        let invalid = write_file_base64(
+            std::env::temp_dir()
+                .join("llm-wiki-invalid-base64.bin")
+                .to_string_lossy()
+                .to_string(),
+            "not!!base64".to_string(),
+        )
+        .await;
+        assert!(invalid.is_err());
+        assert!(invalid.unwrap_err().contains("Invalid base64"));
+
+        let relative = write_file_base64("relative.bin".to_string(), "AA==".to_string()).await;
+        assert!(relative.is_err());
+        assert!(relative.unwrap_err().contains("requires an absolute path"));
     }
 
     /// Ad-hoc probe: run the production PDF extraction path against every
@@ -1625,7 +2148,7 @@ mod tests {
             // Call extract_pdf_text directly (not read_file) so we bypass
             // the .cache sibling dir and always exercise the parser.
             let path_str = path.to_string_lossy().to_string();
-            let result = std::panic::catch_unwind(|| extract_pdf_text(&path_str));
+            let result = std::panic::catch_unwind(|| extract_pdf_text(&path_str, true));
             match result {
                 Ok(Ok(text)) => {
                     ok += 1;
@@ -1693,13 +2216,7 @@ mod tests {
     // would be surfaced here and then wrongly deleted downstream.
 
     fn make_wiki(files: &[(&str, &str)]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "wiki-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = std::env::temp_dir().join(format!("wiki-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         for (rel, body) in files {
             let p = dir.join(rel);
@@ -1898,15 +2415,91 @@ mod tests {
     // folder import button.
 
     fn make_temp_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "llmwiki-copydir-{label}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("llmwiki-copydir-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn build_tree_hides_dot_entries_by_default_and_includes_them_when_asked() {
+        let root = make_temp_dir("build-tree-hidden");
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::write(root.join(".claude/CLAUDE.md"), "x").unwrap();
+        fs::create_dir_all(root.join("visible")).unwrap();
+        fs::write(root.join("visible/doc.md"), "y").unwrap();
+        fs::write(root.join(".env"), "secret").unwrap();
+
+        // Default: dot entries (incl. .env) hidden, normal entries shown.
+        let hidden = build_tree(&root, 0, 30, false).unwrap();
+        let hidden_names: Vec<&str> = hidden.iter().map(|n| n.name.as_str()).collect();
+        assert!(hidden_names.contains(&"visible"));
+        assert!(
+            !hidden_names.iter().any(|n| n.starts_with('.')),
+            "no dot entries should leak by default: {hidden_names:?}"
+        );
+
+        // include_hidden=true: dotfolders/dotfiles present.
+        let shown = build_tree(&root, 0, 30, true).unwrap();
+        let shown_names: Vec<&str> = shown.iter().map(|n| n.name.as_str()).collect();
+        assert!(shown_names.contains(&".claude"));
+        assert!(shown_names.contains(&".env"));
+        assert!(shown_names.contains(&"visible"));
+
+        // The dotfolder's children come through too.
+        let claude = shown.iter().find(|n| n.name == ".claude").unwrap();
+        let kids = claude
+            .children
+            .as_ref()
+            .expect(".claude should have children");
+        assert!(kids.iter().any(|n| n.name == "CLAUDE.md"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_tree_respects_max_depth_for_shallow_listing() {
+        let root = make_temp_dir("build-tree-depth");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/deep.md"), "x").unwrap();
+
+        let shallow = build_tree(&root, 0, 1, false).unwrap();
+        let a = shallow.iter().find(|n| n.name == "a").unwrap();
+        assert!(a.is_dir);
+        assert!(
+            a.children.is_none(),
+            "max_depth=1 must not load grandchildren"
+        );
+
+        let deeper = build_tree(&root, 0, 3, false).unwrap();
+        let a = deeper.iter().find(|n| n.name == "a").unwrap();
+        let b = a
+            .children
+            .as_ref()
+            .and_then(|children| children.iter().find(|n| n.name == "b"))
+            .expect("max_depth=3 should include nested directory");
+        let files = b.children.as_ref().expect("b should include deep file");
+        assert!(files.iter().any(|n| n.name == "deep.md"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reject_relative_write_paths_before_touching_cwd() {
+        assert!(require_absolute_path("write_file", "wiki/sources/stray.md").is_err());
+        assert!(require_absolute_path("write_file", "./wiki/sources/stray.md").is_err());
+    }
+
+    #[test]
+    fn allow_absolute_write_paths() {
+        assert!(require_absolute_path("write_file", "/tmp/project/wiki/sources/page.md").is_ok());
+        assert!(require_absolute_path("write_file", "C:/project/wiki/sources/page.md").is_ok());
+        assert!(require_absolute_path("write_file", r"C:\project\wiki\sources\page.md").is_ok());
+        assert!(
+            require_absolute_path("write_file", r"\\server\share\wiki\sources\page.md").is_ok()
+        );
+        assert!(require_absolute_path("write_file", "//server/share/wiki/sources/page.md").is_ok());
+        assert!(require_absolute_path("write_file", "C:wiki/sources/page.md").is_err());
     }
 
     /// Pull the inner sync `copy_recursive` body out from
@@ -2044,5 +2637,120 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn selection_edit_rejects_stale_content_and_preserves_user_changes() {
+        let root = make_temp_dir("selection-edit");
+        let file = root.join("wiki/page.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "before selected after").unwrap();
+
+        let updated = apply_text_selection_edit_inner(
+            root.to_str().unwrap(),
+            file.to_str().unwrap(),
+            "before ",
+            "selected",
+            " after",
+            "replacement",
+        )
+        .unwrap();
+        assert_eq!(updated, "before replacement after");
+
+        std::fs::write(&file, "user changed the file").unwrap();
+        let error = apply_text_selection_edit_inner(
+            root.to_str().unwrap(),
+            file.to_str().unwrap(),
+            "before ",
+            "selected",
+            " after",
+            "second replacement",
+        )
+        .unwrap_err();
+        assert!(error.contains("changed after the selection"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "user changed the file"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_link_page_uses_safe_unique_cross_platform_names() {
+        let root = make_temp_dir("missing-link-page");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+        let first =
+            create_missing_wiki_page_inner(root.to_str().unwrap(), "AUX: Safety / Notes?", None)
+                .unwrap();
+        let second = create_missing_wiki_page_inner(
+            root.to_str().unwrap(),
+            "AUX: Safety / Notes?",
+            Some("# Draft"),
+        )
+        .unwrap();
+        assert_eq!(first, "wiki/concepts/AUX- Safety - Notes.md");
+        assert_eq!(second, "wiki/concepts/AUX- Safety - Notes-2.md");
+        assert_eq!(
+            std::fs::read_to_string(root.join(second)).unwrap(),
+            "# Draft"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_link_page_handles_reserved_cjk_and_traversal_titles_without_overwrite() {
+        let root = make_temp_dir("missing-link-adversarial");
+        std::fs::create_dir_all(root.join("wiki/concepts")).unwrap();
+        std::fs::write(root.join("wiki/concepts/Existing Page.md"), "user content").unwrap();
+
+        let reserved = create_missing_wiki_page_inner(root.to_str().unwrap(), "AUX", None).unwrap();
+        let cjk =
+            create_missing_wiki_page_inner(root.to_str().unwrap(), "知识 图谱", None).unwrap();
+        let traversal =
+            create_missing_wiki_page_inner(root.to_str().unwrap(), "../../escape", None).unwrap();
+        let allocated =
+            create_missing_wiki_page_inner(root.to_str().unwrap(), "Existing Page", None).unwrap();
+
+        assert_eq!(reserved, "wiki/concepts/page-AUX.md");
+        assert_eq!(cjk, "wiki/concepts/知识 图谱.md");
+        assert_eq!(traversal, "wiki/concepts/escape.md");
+        assert_eq!(allocated, "wiki/concepts/Existing Page-2.md");
+        assert_eq!(
+            std::fs::read_to_string(root.join("wiki/concepts/Existing Page.md")).unwrap(),
+            "user content"
+        );
+        assert!(!root.parent().unwrap().join("escape.md").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_link_page_rejects_content_over_two_megabytes() {
+        let root = make_temp_dir("missing-link-size");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+        let content = "x".repeat(2 * 1024 * 1024 + 1);
+        let error = create_missing_wiki_page_inner(root.to_str().unwrap(), "large", Some(&content))
+            .unwrap_err();
+        assert!(error.contains("2 MB"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selection_edit_rejects_files_outside_project() {
+        let root = make_temp_dir("selection-boundary");
+        let outside = make_temp_dir("selection-outside").join("outside.md");
+        std::fs::write(&outside, "selected").unwrap();
+        let error = apply_text_selection_edit_inner(
+            root.to_str().unwrap(),
+            outside.to_str().unwrap(),
+            "",
+            "selected",
+            "",
+            "replacement",
+        )
+        .unwrap_err();
+        assert!(error.contains("inside the project"));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "selected");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside.parent().unwrap());
     }
 }

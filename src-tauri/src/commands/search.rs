@@ -21,6 +21,9 @@ const CONTENT_TOKEN_WEIGHT: f64 = 1.0;
 const SNIPPET_CONTEXT: usize = 80;
 const SEARCH_EMBEDDING_TIMEOUT_SECS: u64 = 8;
 const MAX_SEARCH_FILES: usize = 10_000;
+const MIN_GRAPH_RESULT_RATIO: f64 = 0.15;
+const MAX_GRAPH_RESULT_RATIO: f64 = 0.30;
+const MAX_GRAPH_SEEDS: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +45,8 @@ pub struct ProjectSearchResult {
     pub images: Vec<SearchImageRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_related_to: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +56,31 @@ pub struct ProjectSearchResponse {
     pub results: Vec<ProjectSearchResult>,
     pub token_hits: usize,
     pub vector_hits: usize,
+    pub graph_hits: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GraphPage {
+    path: String,
+    title: String,
+    content: String,
+    links: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageLinkEntry {
+    pub title: String,
+    pub path: Option<String>,
+    pub snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageLinksResponse {
+    pub outgoing: Vec<PageLinkEntry>,
+    pub backlinks: Vec<PageLinkEntry>,
+    pub missing: Vec<PageLinkEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +90,14 @@ pub struct SearchEmbeddingConfig {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
-    pub output_dimensionality: Option<u32>,
+    pub output_dimensionality: Option<f64>,
+    /// Extra HTTP headers to send with every embedding request, e.g.
+    /// `X-Model-Provider-Id: siliconflow` for the mify gateway.
+    /// Reserved names (Authorization, Content-Type, Host,
+    /// Content-Length, x-goog-api-key) are skipped — they're managed
+    /// by the client.
+    #[serde(default)]
+    pub extra_headers: Option<BTreeMap<String, String>>,
 }
 
 #[tauri::command]
@@ -87,6 +124,169 @@ pub async fn search_project(
     .await
 }
 
+#[tauri::command]
+pub async fn embedding_fetch(
+    text: String,
+    cfg: SearchEmbeddingConfig,
+    max_retries: Option<usize>,
+) -> Result<Vec<f32>, String> {
+    run_guarded_async("embedding_fetch", async move {
+        fetch_embedding_with_retry(&text, &cfg, max_retries.unwrap_or(3)).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn embedding_fetch_batch(
+    texts: Vec<String>,
+    cfg: SearchEmbeddingConfig,
+) -> Result<Vec<Vec<f32>>, String> {
+    run_guarded_async("embedding_fetch_batch", async move {
+        fetch_embedding_batch(&texts, &cfg).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_page_links(
+    project_path: String,
+    file_path: String,
+) -> Result<PageLinksResponse, String> {
+    tokio::task::spawn_blocking(move || get_page_links_inner(&project_path, &file_path))
+        .await
+        .map_err(|err| format!("page links worker failed: {err}"))?
+}
+
+/// Build link relationships from Markdown source rather than the UI's lazy
+/// file tree. Canonical paths enforce the project/wiki boundary, while the
+/// returned paths stay project-relative so all desktop platforms share one
+/// wire format and Windows separators never leak into frontend routing.
+fn get_page_links_inner(project_path: &str, file_path: &str) -> Result<PageLinksResponse, String> {
+    let project = fs::canonicalize(project_path)
+        .map_err(|err| format!("Failed to resolve project path: {err}"))?;
+    let file =
+        fs::canonicalize(file_path).map_err(|err| format!("Failed to resolve page path: {err}"))?;
+    let wiki_root = project.join("wiki");
+    if !file.starts_with(&wiki_root)
+        || !file.is_file()
+        || file.extension().and_then(|value| value.to_str()) != Some("md")
+    {
+        return Err("Page links target must be an existing Markdown file under wiki/".to_string());
+    }
+
+    let mut pages = BTreeMap::<String, GraphPage>::new();
+    let canonical_project = project.to_string_lossy();
+    for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
+        if pages.len() >= MAX_SEARCH_FILES
+            || !entry.file_type().is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("md")
+        {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let path = relative_to_project(&canonical_project, entry.path());
+        let title = extract_title(
+            &content,
+            entry
+                .path()
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+        );
+        pages.insert(
+            normalize_path(&path),
+            GraphPage {
+                path,
+                title,
+                links: extract_wikilinks(&content),
+                content,
+            },
+        );
+    }
+
+    let current_path = normalize_path(&relative_to_project(&canonical_project, &file));
+    let current = pages
+        .get(&current_path)
+        .ok_or_else(|| "Page is not available in the current wiki index".to_string())?;
+    let mut outgoing = Vec::new();
+    let mut missing = Vec::new();
+    for link in &current.links {
+        if let Some(target_path) = resolve_reader_wikilink(&pages, link) {
+            if target_path.as_str() == current_path {
+                continue;
+            }
+            if let Some(target) = pages.get(target_path) {
+                outgoing.push(PageLinkEntry {
+                    title: target.title.clone(),
+                    path: Some(target.path.clone()),
+                    snippet: None,
+                });
+            }
+        } else {
+            missing.push(PageLinkEntry {
+                title: link.clone(),
+                path: None,
+                snippet: None,
+            });
+        }
+    }
+
+    let mut backlinks = Vec::new();
+    for (path, page) in &pages {
+        if path == &current_path {
+            continue;
+        }
+        let links_here = page.links.iter().any(|link| {
+            resolve_reader_wikilink(&pages, link)
+                .is_some_and(|target| target.as_str() == current_path)
+        });
+        if links_here {
+            backlinks.push(PageLinkEntry {
+                title: page.title.clone(),
+                path: Some(page.path.clone()),
+                snippet: Some(build_snippet(&page.content, &current.title)),
+            });
+        }
+    }
+
+    outgoing.sort_by(|a, b| a.title.cmp(&b.title));
+    outgoing.dedup_by(|a, b| a.path == b.path);
+    backlinks.sort_by(|a, b| a.title.cmp(&b.title));
+    missing.sort_by(|a, b| a.title.cmp(&b.title));
+    missing.dedup_by(|a, b| a.title == b.title);
+    Ok(PageLinksResponse {
+        outgoing,
+        backlinks,
+        missing,
+    })
+}
+
+/// Mirror `resolveRelatedSlug` in the frontend reader. Path-shaped links must
+/// match their project-relative path exactly; bare links resolve by exact
+/// filename after adding `.md`. Deliberately avoid title and fuzzy aliases so
+/// the links panel never claims a target that the rendered page cannot open.
+fn resolve_reader_wikilink<'a>(
+    pages: &'a BTreeMap<String, GraphPage>,
+    link: &str,
+) -> Option<&'a String> {
+    let link = link.trim().replace('\\', "/");
+    if link.contains('/') {
+        return pages.get_key_value(&link).map(|(path, _)| path);
+    }
+    let filename = if link.ends_with(".md") {
+        link
+    } else {
+        format!("{link}.md")
+    };
+    pages.keys().find(|path| {
+        std::path::Path::new(path.as_str())
+            .file_name()
+            .is_some_and(|name| name == filename.as_str())
+    })
+}
+
 pub async fn resolve_query_embedding(
     query: &str,
     explicit_embedding: Option<Vec<f32>>,
@@ -101,7 +301,7 @@ pub async fn resolve_query_embedding(
     if !cfg.enabled || cfg.endpoint.trim().is_empty() || cfg.model.trim().is_empty() {
         return Ok(None);
     }
-    match fetch_embedding(query, &cfg).await {
+    match fetch_embedding_with_retry(query, &cfg, 0).await {
         Ok(embedding) => validate_query_embedding(embedding).map(Some),
         Err(err) => {
             eprintln!("[Search] embedding disabled for this request: {err}");
@@ -140,6 +340,7 @@ pub async fn search_project_inner(
     let query_phrase = trim_query_punctuation(&query.to_lowercase());
     let mut results = Vec::new();
     let mut page_paths_by_stem = BTreeMap::new();
+    let mut graph_pages = BTreeMap::new();
 
     let wiki_root = Path::new(&project_path).join("wiki");
     if wiki_root.exists() {
@@ -172,7 +373,16 @@ pub async fn search_project_inner(
                     );
                 }
             }
-            if let Some(hit) = score_file(
+            let relative_path = relative_to_project(&project_path, entry.path());
+            let title = extract_title(
+                &content,
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default(),
+            );
+            let hit = score_file(
                 &project_path,
                 entry.path(),
                 &content,
@@ -180,7 +390,17 @@ pub async fn search_project_inner(
                 &query_phrase,
                 &query,
                 include_content,
-            ) {
+            );
+            graph_pages.insert(
+                normalize_path(&relative_path),
+                GraphPage {
+                    path: relative_path,
+                    title,
+                    links: extract_wikilinks(&content),
+                    content,
+                },
+            );
+            if let Some(hit) = hit {
                 results.push(hit);
             }
         }
@@ -229,23 +449,9 @@ pub async fn search_project_inner(
         }
     }
 
-    if vector_hits == 0 {
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        results.truncate(limit);
-        return Ok(ProjectSearchResponse {
-            mode: "keyword".to_string(),
-            token_hits: token_rank.len(),
-            vector_hits,
-            results,
-        });
+    if vector_hits > 0 {
+        apply_rrf_scores(&mut results, &token_rank, &vector_rank, &vector_score);
     }
-
-    apply_rrf_scores(&mut results, &token_rank, &vector_rank, &vector_score);
 
     results.sort_by(|a, b| {
         b.score
@@ -253,12 +459,19 @@ pub async fn search_project_inner(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.path.cmp(&b.path))
     });
-    results.truncate(limit);
+    let graph_hits = blend_graph_results(
+        &mut results,
+        &graph_pages,
+        limit,
+        vector_hits,
+        include_content,
+    );
 
     Ok(ProjectSearchResponse {
-        mode: search_mode(token_rank.is_empty(), vector_hits).to_string(),
+        mode: search_mode(token_rank.is_empty(), vector_hits, graph_hits).to_string(),
         token_hits: token_rank.len(),
         vector_hits,
+        graph_hits,
         results,
     })
 }
@@ -286,8 +499,193 @@ fn apply_rrf_scores(
     }
 }
 
-fn search_mode(token_rank_empty: bool, vector_hits: usize) -> &'static str {
-    if vector_hits == 0 {
+/// Reserve 15-30% of the final window for one-hop graph expansion. A full
+/// vector window leaves the minimum graph share; sparse vector retrieval moves
+/// progressively toward the maximum. Missing graph candidates automatically
+/// return their slots to keyword/vector results.
+fn graph_result_quota(limit: usize, vector_hits: usize) -> usize {
+    if limit < 2 {
+        return 0;
+    }
+    let vector_coverage = vector_hits.min(limit) as f64 / limit as f64;
+    let ratio = MAX_GRAPH_RESULT_RATIO
+        - (MAX_GRAPH_RESULT_RATIO - MIN_GRAPH_RESULT_RATIO) * vector_coverage;
+    ((limit as f64 * ratio).ceil() as usize).clamp(1, limit - 1)
+}
+
+fn blend_graph_results(
+    ranked_results: &mut Vec<ProjectSearchResult>,
+    pages: &BTreeMap<String, GraphPage>,
+    limit: usize,
+    vector_hits: usize,
+    include_content: bool,
+) -> usize {
+    if ranked_results.is_empty() || pages.is_empty() {
+        ranked_results.truncate(limit);
+        return 0;
+    }
+
+    let mut aliases = BTreeMap::<String, String>::new();
+    for (normalized_path, page) in pages {
+        let wiki_relative = page.path.strip_prefix("wiki/").unwrap_or(&page.path);
+        let stem = file_stem(&page.path);
+        for alias in [
+            page.path.as_str(),
+            wiki_relative,
+            stem.as_str(),
+            page.title.as_str(),
+        ] {
+            aliases.insert(normalize_graph_alias(alias), normalized_path.clone());
+        }
+    }
+
+    let mut adjacency = BTreeMap::<String, BTreeSet<String>>::new();
+    for (source, page) in pages {
+        for link in &page.links {
+            let Some(target) = aliases.get(&normalize_graph_alias(link)) else {
+                continue;
+            };
+            if source == target {
+                continue;
+            }
+            adjacency
+                .entry(source.clone())
+                .or_default()
+                .insert(target.clone());
+            adjacency
+                .entry(target.clone())
+                .or_default()
+                .insert(source.clone());
+        }
+    }
+
+    let seed_paths: Vec<String> = ranked_results
+        .iter()
+        .take(limit.min(MAX_GRAPH_SEEDS))
+        .map(|result| normalize_path(&result.path))
+        .collect();
+    let seed_set: BTreeSet<String> = seed_paths.iter().cloned().collect();
+    let mut candidate_scores = BTreeMap::<String, f64>::new();
+    let mut candidate_seeds = BTreeMap::<String, BTreeSet<String>>::new();
+    for (rank, seed) in seed_paths.iter().enumerate() {
+        let Some(neighbors) = adjacency.get(seed) else {
+            continue;
+        };
+        for neighbor in neighbors {
+            if seed_set.contains(neighbor) {
+                continue;
+            }
+            *candidate_scores.entry(neighbor.clone()).or_default() += 1.0 / (rank + 1) as f64;
+            if let Some(seed_page) = pages.get(seed) {
+                candidate_seeds
+                    .entry(neighbor.clone())
+                    .or_default()
+                    .insert(seed_page.title.clone());
+            }
+        }
+    }
+
+    let mut candidates: Vec<(String, f64)> = candidate_scores.into_iter().collect();
+    candidates.sort_by(|(path_a, score_a), (path_b, score_b)| {
+        score_b
+            .partial_cmp(score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| path_a.cmp(path_b))
+    });
+    candidates.truncate(graph_result_quota(limit, vector_hits));
+    if candidates.is_empty() {
+        ranked_results.truncate(limit);
+        return 0;
+    }
+
+    let selected_paths: BTreeSet<String> =
+        candidates.iter().map(|(path, _)| path.clone()).collect();
+    let mut existing = BTreeMap::<String, ProjectSearchResult>::new();
+    let mut ranked_paths = Vec::new();
+    for result in ranked_results.drain(..) {
+        let path = normalize_path(&result.path);
+        ranked_paths.push(path.clone());
+        existing.insert(path, result);
+    }
+
+    let graph_count = candidates.len();
+    let base_limit = limit.saturating_sub(graph_count);
+    let mut base_results: Vec<ProjectSearchResult> = ranked_paths
+        .iter()
+        .filter(|path| !selected_paths.contains(*path))
+        .filter_map(|path| existing.get(path).cloned())
+        .take(base_limit)
+        .collect();
+
+    for (path, graph_score) in candidates {
+        if let Some(result) = existing.remove(&path) {
+            let mut result = result;
+            result.graph_related_to = candidate_seeds
+                .remove(&path)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            base_results.push(result);
+            continue;
+        }
+        let Some(page) = pages.get(&path) else {
+            continue;
+        };
+        let related_titles = candidate_seeds
+            .remove(&path)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let related = related_titles.join(", ");
+        base_results.push(ProjectSearchResult {
+            path: page.path.clone(),
+            title: page.title.clone(),
+            snippet: format!("Graph neighbor of {related}"),
+            title_match: false,
+            score: graph_score / (RRF_K + 1.0),
+            vector_score: None,
+            images: extract_image_refs(&page.content),
+            content: include_content.then(|| page.content.clone()),
+            graph_related_to: related_titles,
+        });
+    }
+    *ranked_results = base_results;
+    graph_count
+}
+
+fn normalize_graph_alias(value: &str) -> String {
+    value
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches(".md")
+        .replace('\\', "/")
+        .replace(' ', "-")
+        .to_lowercase()
+}
+
+fn extract_wikilinks(content: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("[[") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find("]]") else {
+            break;
+        };
+        let target = rest[..end].split('|').next().unwrap_or_default().trim();
+        if !target.is_empty() {
+            links.push(target.to_string());
+        }
+        rest = &rest[end + 2..];
+    }
+    links
+}
+
+fn search_mode(token_rank_empty: bool, vector_hits: usize, graph_hits: usize) -> &'static str {
+    if graph_hits > 0 {
+        "hybrid"
+    } else if vector_hits == 0 {
         "keyword"
     } else if token_rank_empty {
         "vector"
@@ -388,6 +786,7 @@ fn materialize_vector_only_results(
                 vector_score: Some(vr.score),
                 images: extract_image_refs(&content),
                 content: include_content.then_some(content),
+                graph_related_to: Vec::new(),
             });
             known.insert(vr.id.clone());
         }
@@ -474,6 +873,7 @@ fn score_file(
         vector_score: None,
         images: extract_image_refs(content),
         content: include_content.then_some(content.to_string()),
+        graph_related_to: Vec::new(),
     })
 }
 
@@ -658,21 +1058,197 @@ pub fn extract_image_refs(content: &str) -> Vec<SearchImageRef> {
     out
 }
 
-async fn fetch_embedding(text: &str, cfg: &SearchEmbeddingConfig) -> Result<Vec<f32>, String> {
-    let is_google = is_google_embedding_config(cfg);
-    let endpoint = if is_google {
-        google_embedding_endpoint(cfg)
-    } else {
-        cfg.endpoint.trim().to_string()
-    };
+async fn fetch_embedding_with_retry(
+    text: &str,
+    cfg: &SearchEmbeddingConfig,
+    max_retries: usize,
+) -> Result<Vec<f32>, String> {
+    let mut current = text.to_string();
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
+        match fetch_embedding_once(&current, cfg).await {
+            Ok(embedding) => return Ok(embedding),
+            Err(EmbeddingFetchError::Oversize(message)) => {
+                if attempts <= max_retries
+                    && current.len() > 64
+                    && halve_text_on_char_boundary(&mut current)
+                {
+                    eprintln!(
+                        "[Embedding] auto-halving after oversize error at {} chars; retrying at {} chars ({attempts}/{})",
+                        text.chars().count(),
+                        current.chars().count(),
+                        max_retries + 1
+                    );
+                    continue;
+                }
+                return Err(format!(
+                    "Endpoint rejected input even at {} chars. Lower Settings -> Embedding -> Max Chunk Chars. {message}",
+                    current.len()
+                ));
+            }
+            Err(EmbeddingFetchError::Other(message)) => return Err(message),
+        }
+    }
+}
+
+async fn fetch_embedding_batch(
+    texts: &[String],
+    cfg: &SearchEmbeddingConfig,
+) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() || texts.len() > 64 {
+        return Err("Embedding batch must contain between 1 and 64 inputs".to_string());
+    }
+    if is_google_embedding_config(cfg) || is_doubao_multimodal_embedding_config(cfg) {
+        return Err(
+            "This embedding provider does not use the OpenAI-compatible batch format".to_string(),
+        );
+    }
+
+    let endpoint = volcengine_embedding_endpoint(cfg);
     let mut req = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(
             SEARCH_EMBEDDING_TIMEOUT_SECS,
         ))
         .build()
         .map_err(|e| format!("Embedding HTTP client error: {e}"))?
-        .post(endpoint)
+        .post(&endpoint)
         .header("Content-Type", "application/json");
+    if is_local_or_private_http_endpoint(&endpoint) {
+        req = req.header("Origin", "http://localhost");
+    }
+    if !cfg.api_key.trim().is_empty() {
+        req = req.bearer_auth(cfg.api_key.trim());
+    }
+    if let Some(extra) = cfg.extra_headers.as_ref() {
+        for (name, value) in extra {
+            let name = name.trim();
+            let value = value.trim();
+            if !name.is_empty()
+                && !value.is_empty()
+                && is_safe_extra_header_name(name)
+                && !is_reserved_extra_header_name(name)
+            {
+                req = req.header(name, value);
+            }
+        }
+    }
+    let response = req
+        .json(&json!({ "model": cfg.model, "input": texts }))
+        .send()
+        .await
+        .map_err(|e| format!("Embedding batch request failed: {e}"))?;
+    let status = response.status();
+    let response_text = response
+        .text()
+        .await
+        .map_err(|e| format!("Embedding batch response read failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Embedding batch API HTTP {status}: {}",
+            response_text.chars().take(200).collect::<String>()
+        ));
+    }
+    let data: Value = serde_json::from_str(&response_text).map_err(|e| {
+        format!(
+            "Embedding batch response parse failed: {e}: {}",
+            response_text.chars().take(200).collect::<String>()
+        )
+    })?;
+    parse_embedding_batch_values(&data, texts.len())
+}
+
+fn parse_embedding_batch_values(data: &Value, expected: usize) -> Result<Vec<Vec<f32>>, String> {
+    let entries = data
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Embedding batch response missing data array".to_string())?;
+    if entries.len() != expected {
+        return Err(format!(
+            "Embedding batch returned {} vectors for {expected} inputs",
+            entries.len()
+        ));
+    }
+    let mut indexed = Vec::with_capacity(entries.len());
+    for (position, entry) in entries.iter().enumerate() {
+        let index = entry
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(position);
+        if index >= expected {
+            return Err("Embedding batch response contains an out-of-range index".to_string());
+        }
+        let values = entry
+            .get("embedding")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Embedding batch response missing vector".to_string())?;
+        let mut vector = Vec::with_capacity(values.len());
+        for value in values {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| "Embedding batch response contains non-number values".to_string())?;
+            if !number.is_finite() {
+                return Err("Embedding batch response contains non-finite values".to_string());
+            }
+            vector.push(number as f32);
+        }
+        if vector.is_empty() {
+            return Err("Embedding batch response vector is empty".to_string());
+        }
+        indexed.push((index, vector));
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    if indexed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("Embedding batch response contains duplicate indexes".to_string());
+    }
+    let dimension = indexed.first().map(|(_, vector)| vector.len()).unwrap_or(0);
+    if indexed.iter().any(|(_, vector)| vector.len() != dimension) {
+        return Err("Embedding batch response contains inconsistent vector dimensions".to_string());
+    }
+    Ok(indexed.into_iter().map(|(_, vector)| vector).collect())
+}
+
+fn halve_text_on_char_boundary(text: &mut String) -> bool {
+    let char_count = text.chars().count();
+    if char_count <= 1 {
+        return false;
+    }
+    let keep = (char_count / 2).max(1);
+    *text = text.chars().take(keep).collect();
+    true
+}
+
+enum EmbeddingFetchError {
+    Oversize(String),
+    Other(String),
+}
+
+async fn fetch_embedding_once(
+    text: &str,
+    cfg: &SearchEmbeddingConfig,
+) -> Result<Vec<f32>, EmbeddingFetchError> {
+    let is_google = is_google_embedding_config(cfg);
+    let is_doubao_multimodal = is_doubao_multimodal_embedding_config(cfg);
+    let endpoint = if is_google {
+        google_embedding_endpoint(cfg)
+    } else {
+        volcengine_embedding_endpoint(cfg)
+    };
+    let mut req = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            SEARCH_EMBEDDING_TIMEOUT_SECS,
+        ))
+        .build()
+        .map_err(|e| EmbeddingFetchError::Other(format!("Embedding HTTP client error: {e}")))?
+        .post(&endpoint)
+        .header("Content-Type", "application/json");
+    // Browser-based local model servers often require a browser-like
+    // Origin even when the request is routed through Rust. Keep this
+    // reserved so user-supplied extra headers cannot override it.
+    if is_local_or_private_http_endpoint(&endpoint) {
+        req = req.header("Origin", "http://localhost");
+    }
     if !cfg.api_key.trim().is_empty() {
         if is_google {
             req = req.header("x-goog-api-key", cfg.api_key.trim());
@@ -680,8 +1256,23 @@ async fn fetch_embedding(text: &str, cfg: &SearchEmbeddingConfig) -> Result<Vec<
             req = req.bearer_auth(cfg.api_key.trim());
         }
     }
+    if let Some(extra) = cfg.extra_headers.as_ref() {
+        for (name, value) in extra {
+            let trimmed = name.trim();
+            let value = value.trim();
+            if trimmed.is_empty() || value.is_empty() || !is_safe_extra_header_name(trimmed) {
+                continue;
+            }
+            if is_reserved_extra_header_name(trimmed) {
+                continue;
+            }
+            req = req.header(trimmed, value);
+        }
+    }
     let body = if is_google {
         google_embedding_body(&cfg.model, text, cfg.output_dimensionality)
+    } else if is_doubao_multimodal {
+        doubao_multimodal_embedding_body(&cfg.model, text)
     } else {
         json!({ "model": cfg.model, "input": text })
     };
@@ -689,21 +1280,60 @@ async fn fetch_embedding(text: &str, cfg: &SearchEmbeddingConfig) -> Result<Vec<
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Embedding request failed: {e}"))?;
+        .map_err(|e| EmbeddingFetchError::Other(format!("Embedding request failed: {e}")))?;
     let status = resp.status();
-    let data: Value = resp
-        .json()
+    let text = resp
+        .text()
         .await
-        .map_err(|e| format!("Embedding response parse failed: {e}"))?;
+        .map_err(|e| EmbeddingFetchError::Other(format!("Embedding response read failed: {e}")))?;
     if !status.is_success() {
-        return Err(format!(
-            "Embedding API HTTP {status}: {}",
-            data.to_string().chars().take(200).collect::<String>()
-        ));
+        let preview = text.chars().take(200).collect::<String>();
+        if looks_like_oversize_error(status.as_u16(), &text) {
+            return Err(EmbeddingFetchError::Oversize(format!(
+                "Embedding API HTTP {status}: {preview}"
+            )));
+        }
+        return Err(EmbeddingFetchError::Other(format!(
+            "Embedding API HTTP {status}: {preview}"
+        )));
     }
+    let data: Value = serde_json::from_str(&text).map_err(|e| {
+        EmbeddingFetchError::Other(format!(
+            "Embedding response parse failed: {e}: {}",
+            text.chars().take(200).collect::<String>()
+        ))
+    })?;
+    parse_embedding_values(&data, is_google, is_doubao_multimodal)
+        .map_err(EmbeddingFetchError::Other)
+}
+
+fn looks_like_oversize_error(status: u16, body: &str) -> bool {
+    if status == 413 {
+        return true;
+    }
+    let lower = body.to_lowercase();
+    lower.contains("too long")
+        || lower.contains("maximum context")
+        || lower.contains("max_tokens")
+        || lower.contains("max tokens")
+        || lower.contains("context length")
+        || lower.contains("token limit")
+        || lower.contains("exceeds")
+        || lower.contains("input length")
+}
+
+fn parse_embedding_values(
+    data: &Value,
+    is_google: bool,
+    is_doubao_multimodal: bool,
+) -> Result<Vec<f32>, String> {
     let values = if is_google {
         data.get("embedding")
             .and_then(|v| v.get("values"))
+            .and_then(Value::as_array)
+    } else if is_doubao_multimodal {
+        data.get("data")
+            .and_then(|v| v.get("embedding"))
             .and_then(Value::as_array)
     } else {
         data.get("data")
@@ -729,9 +1359,160 @@ async fn fetch_embedding(text: &str, cfg: &SearchEmbeddingConfig) -> Result<Vec<
     Ok(out)
 }
 
+fn is_safe_extra_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
+}
+
+fn is_reserved_extra_header_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "authorization" | "content-type" | "host" | "content-length" | "origin" | "x-goog-api-key"
+    )
+}
+
 fn is_google_embedding_config(cfg: &SearchEmbeddingConfig) -> bool {
     let endpoint = cfg.endpoint.to_lowercase();
     endpoint.contains("generativelanguage.googleapis.com") || endpoint.contains(":embedcontent")
+}
+
+fn is_local_or_private_http_endpoint(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase();
+    if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") {
+        return true;
+    }
+    let octets = host
+        .split('.')
+        .map(str::parse::<u8>)
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(octets) = octets else {
+        return false;
+    };
+    if octets.len() != 4 {
+        return false;
+    }
+    octets[0] == 10
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
+        || octets[0] == 127
+}
+
+fn is_volcengine_embedding_endpoint(endpoint: &str) -> bool {
+    let host = reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_lowercase()))
+        .unwrap_or_else(|| {
+            let trimmed = endpoint.trim();
+            trimmed
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(trimmed)
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("")
+                .to_lowercase()
+        });
+    host == "volces.com" || host.ends_with(".volces.com") || host.contains("volcengine")
+}
+
+fn is_doubao_multimodal_embedding_config(cfg: &SearchEmbeddingConfig) -> bool {
+    cfg.model
+        .trim()
+        .to_lowercase()
+        .contains("doubao-embedding-vision")
+}
+
+fn volcengine_embedding_endpoint(cfg: &SearchEmbeddingConfig) -> String {
+    let raw = cfg.endpoint.trim();
+    if !is_volcengine_embedding_endpoint(raw) {
+        return raw.to_string();
+    }
+    let suffix = if is_doubao_multimodal_embedding_config(cfg) {
+        "/embeddings/multimodal"
+    } else {
+        "/embeddings"
+    };
+    append_endpoint_path(raw, suffix)
+}
+
+fn append_endpoint_path(endpoint: &str, target_suffix: &str) -> String {
+    let suffix = target_suffix.trim_start_matches('/');
+    match reqwest::Url::parse(endpoint) {
+        Ok(mut url) => {
+            let path = url.path().trim_end_matches('/').to_string();
+            let lower_path = path.to_lowercase();
+            let lower_suffix = format!("/{}", suffix.to_lowercase());
+            if lower_path.ends_with(&lower_suffix) {
+                url.set_path(if path.is_empty() { "/" } else { &path });
+                return url.to_string();
+            }
+            if lower_path.ends_with("/embeddings/multimodal") && lower_suffix == "/embeddings" {
+                let base = path.trim_end_matches("/multimodal");
+                url.set_path(if base.is_empty() { "/" } else { base });
+                return url.to_string();
+            }
+            if lower_path.ends_with("/embeddings") && lower_suffix == "/embeddings/multimodal" {
+                url.set_path(&format!("{path}/multimodal"));
+                return url.to_string();
+            }
+            let next = format!("{path}/{suffix}").replace("//", "/");
+            url.set_path(&next);
+            url.to_string()
+        }
+        Err(_) => {
+            let (base, query) = endpoint.split_once('?').unwrap_or((endpoint, ""));
+            let trimmed = base.trim_end_matches('/');
+            let lower = trimmed.to_lowercase();
+            let lower_suffix = format!("/{}", suffix.to_lowercase());
+            let next = if lower.ends_with(&lower_suffix) {
+                trimmed.to_string()
+            } else if lower.ends_with("/embeddings/multimodal") && lower_suffix == "/embeddings" {
+                trimmed.trim_end_matches("/multimodal").to_string()
+            } else if lower.ends_with("/embeddings") && lower_suffix == "/embeddings/multimodal" {
+                format!("{trimmed}/multimodal")
+            } else {
+                format!("{trimmed}/{suffix}")
+            };
+            if query.is_empty() {
+                next
+            } else {
+                format!("{next}?{query}")
+            }
+        }
+    }
 }
 
 fn google_embedding_endpoint(cfg: &SearchEmbeddingConfig) -> String {
@@ -788,7 +1569,7 @@ fn strip_google_api_key_query(endpoint: &str) -> String {
     }
 }
 
-fn google_embedding_body(model: &str, text: &str, output_dimensionality: Option<u32>) -> Value {
+fn google_embedding_body(model: &str, text: &str, output_dimensionality: Option<f64>) -> Value {
     let model_path = if model.trim().starts_with("models/") {
         model.trim().to_string()
     } else {
@@ -798,10 +1579,21 @@ fn google_embedding_body(model: &str, text: &str, output_dimensionality: Option<
         "model": model_path,
         "content": { "parts": [{ "text": text }] },
     });
-    if let Some(dim) = output_dimensionality.filter(|dim| *dim > 0) {
+    if let Some(dim) = output_dimensionality
+        .filter(|dim| dim.is_finite() && *dim >= 1.0)
+        .map(|dim| dim.floor() as u32)
+    {
         body["output_dimensionality"] = json!(dim);
     }
     body
+}
+
+fn doubao_multimodal_embedding_body(model: &str, text: &str) -> Value {
+    json!({
+        "model": model,
+        "encoding_format": "float",
+        "input": [{ "type": "text", "text": text }],
+    })
 }
 
 pub fn build_snippet(content: &str, query: &str) -> String {
@@ -885,6 +1677,7 @@ mod tests {
             vector_score: None,
             images: vec![],
             content: None,
+            graph_related_to: Vec::new(),
         }
     }
 
@@ -938,7 +1731,8 @@ mod tests {
             endpoint: "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents?key=URL_KEY&alt=json".to_string(),
             api_key: "HEADER_KEY".to_string(),
             model: "gemini-embedding-001".to_string(),
-            output_dimensionality: Some(768),
+            output_dimensionality: Some(768.0),
+            extra_headers: None,
         };
 
         let endpoint = google_embedding_endpoint(&cfg);
@@ -947,9 +1741,178 @@ mod tests {
         assert!(!endpoint.contains("URL_KEY"));
         assert!(endpoint.contains("alt=json"));
 
-        let body = google_embedding_body("gemini-embedding-001", "hello", Some(768));
+        let body = google_embedding_body("gemini-embedding-001", "hello", Some(768.0));
         assert_eq!(body["model"], "models/gemini-embedding-001");
         assert_eq!(body["output_dimensionality"], 768);
+    }
+
+    #[test]
+    fn volcengine_embedding_endpoint_only_appends_for_volcengine_hosts() {
+        let cfg = SearchEmbeddingConfig {
+            enabled: true,
+            endpoint: "https://ark.cn-beijing.volces.com/api/v3".to_string(),
+            api_key: "ARK_KEY".to_string(),
+            model: "doubao-embedding-text-240715".to_string(),
+            output_dimensionality: None,
+            extra_headers: None,
+        };
+        assert_eq!(
+            volcengine_embedding_endpoint(&cfg),
+            "https://ark.cn-beijing.volces.com/api/v3/embeddings"
+        );
+
+        let custom = SearchEmbeddingConfig {
+            endpoint: "https://gateway.example.com/proxy/volcengine?upstream=volces.com"
+                .to_string(),
+            ..cfg.clone()
+        };
+        assert_eq!(
+            volcengine_embedding_endpoint(&custom),
+            "https://gateway.example.com/proxy/volcengine?upstream=volces.com"
+        );
+    }
+
+    #[test]
+    fn doubao_multimodal_endpoint_and_body_use_vision_shape() {
+        let cfg = SearchEmbeddingConfig {
+            enabled: true,
+            endpoint: "https://ark.cn-beijing.volces.com/api/v3/embeddings?trace=1".to_string(),
+            api_key: "ARK_KEY".to_string(),
+            model: "doubao-embedding-vision".to_string(),
+            output_dimensionality: None,
+            extra_headers: None,
+        };
+
+        assert_eq!(
+            volcengine_embedding_endpoint(&cfg),
+            "https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal?trace=1"
+        );
+
+        let body = doubao_multimodal_embedding_body("doubao-embedding-vision", "hello");
+        assert_eq!(body["model"], "doubao-embedding-vision");
+        assert_eq!(body["encoding_format"], "float");
+        assert_eq!(body["input"][0]["type"], "text");
+        assert_eq!(body["input"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn volcengine_embedding_endpoint_does_not_duplicate_existing_suffixes() {
+        let cfg = SearchEmbeddingConfig {
+            enabled: true,
+            endpoint: "https://ARK.cn-beijing.volces.com/api/v3/embeddings".to_string(),
+            api_key: "ARK_KEY".to_string(),
+            model: "doubao-embedding-text-240715".to_string(),
+            output_dimensionality: None,
+            extra_headers: None,
+        };
+        assert_eq!(
+            volcengine_embedding_endpoint(&cfg),
+            "https://ark.cn-beijing.volces.com/api/v3/embeddings"
+        );
+
+        let vision = SearchEmbeddingConfig {
+            endpoint: "https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal".to_string(),
+            model: "doubao-embedding-vision".to_string(),
+            ..cfg.clone()
+        };
+        assert_eq!(
+            volcengine_embedding_endpoint(&vision),
+            "https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal"
+        );
+
+        let text_on_multimodal_endpoint = SearchEmbeddingConfig {
+            model: "doubao-embedding-text-240715".to_string(),
+            ..vision
+        };
+        assert_eq!(
+            volcengine_embedding_endpoint(&text_on_multimodal_endpoint),
+            "https://ark.cn-beijing.volces.com/api/v3/embeddings"
+        );
+    }
+
+    #[test]
+    fn doubao_multimodal_detection_is_model_driven_for_custom_gateways() {
+        let cfg = SearchEmbeddingConfig {
+            enabled: true,
+            endpoint: "https://gateway.example.com/ark/embeddings/multimodal".to_string(),
+            api_key: "KEY".to_string(),
+            model: "doubao-embedding-vision".to_string(),
+            output_dimensionality: None,
+            extra_headers: None,
+        };
+
+        assert!(is_doubao_multimodal_embedding_config(&cfg));
+        assert_eq!(
+            volcengine_embedding_endpoint(&cfg),
+            "https://gateway.example.com/ark/embeddings/multimodal"
+        );
+
+        let body = doubao_multimodal_embedding_body(&cfg.model, "hello");
+        assert_eq!(body["input"][0]["type"], "text");
+        assert_eq!(body["input"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn doubao_multimodal_response_shape_is_distinct_from_openai_shape() {
+        let values =
+            parse_embedding_values(&json!({ "data": { "embedding": [0.1, 0.2] } }), false, true)
+                .expect("vision response should parse");
+        assert_eq!(values, vec![0.1, 0.2]);
+
+        assert!(
+            parse_embedding_values(&json!({ "data": [{ "embedding": [0.1] }] }), false, true,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn extra_embedding_header_names_are_validated_and_reserved_names_are_skipped() {
+        assert!(is_safe_extra_header_name("X-Model-Provider-Id"));
+        assert!(is_safe_extra_header_name("x_trace.id"));
+        assert!(!is_safe_extra_header_name(""));
+        assert!(!is_safe_extra_header_name("Bad Header"));
+        assert!(!is_safe_extra_header_name("中文"));
+
+        assert!(is_reserved_extra_header_name("Authorization"));
+        assert!(is_reserved_extra_header_name("content-type"));
+        assert!(is_reserved_extra_header_name("Origin"));
+        assert!(is_reserved_extra_header_name("X-Goog-Api-Key"));
+        assert!(!is_reserved_extra_header_name("X-Model-Provider-Id"));
+    }
+
+    #[test]
+    fn embedding_origin_header_is_limited_to_local_or_private_endpoints() {
+        assert!(is_local_or_private_http_endpoint(
+            "http://127.0.0.1:1234/v1/embeddings"
+        ));
+        assert!(is_local_or_private_http_endpoint(
+            "http://192.168.1.20:11434/v1/embeddings"
+        ));
+        assert!(is_local_or_private_http_endpoint(
+            "http://172.16.0.5/v1/embeddings"
+        ));
+        assert!(!is_local_or_private_http_endpoint(
+            "https://api.openai.com/v1/embeddings"
+        ));
+    }
+
+    #[test]
+    fn embedding_halving_never_splits_cjk_codepoints() {
+        let mut text = "默会知识库".to_string();
+        assert!(halve_text_on_char_boundary(&mut text));
+        assert_eq!(text, "默会");
+    }
+
+    #[test]
+    fn google_embedding_body_floors_positive_dimensions_and_omits_invalid_values() {
+        let body = google_embedding_body("gemini-embedding-001", "hello", Some(1.9));
+        assert_eq!(body["output_dimensionality"], 1);
+
+        let zero = google_embedding_body("gemini-embedding-001", "hello", Some(0.0));
+        assert!(zero.get("output_dimensionality").is_none());
+
+        let negative = google_embedding_body("gemini-embedding-001", "hello", Some(-4.0));
+        assert!(negative.get("output_dimensionality").is_none());
     }
 
     #[test]
@@ -979,9 +1942,19 @@ mod tests {
 
     #[test]
     fn search_mode_distinguishes_keyword_vector_and_hybrid() {
-        assert_eq!(search_mode(false, 0), "keyword");
-        assert_eq!(search_mode(true, 3), "vector");
-        assert_eq!(search_mode(false, 3), "hybrid");
+        assert_eq!(search_mode(false, 0, 0), "keyword");
+        assert_eq!(search_mode(true, 3, 0), "vector");
+        assert_eq!(search_mode(false, 3, 0), "hybrid");
+        assert_eq!(search_mode(false, 0, 1), "hybrid");
+    }
+
+    #[test]
+    fn graph_quota_scales_from_thirty_to_fifteen_percent() {
+        assert_eq!(graph_result_quota(1, 0), 0);
+        assert_eq!(graph_result_quota(20, 0), 6);
+        assert_eq!(graph_result_quota(20, 10), 5);
+        assert_eq!(graph_result_quota(20, 20), 3);
+        assert_eq!(graph_result_quota(10, 100), 2);
     }
 
     #[test]
@@ -1065,6 +2038,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keyword_search_always_blends_available_graph_neighbors() {
+        let root = tmp_project();
+        write_page(
+            &root,
+            "wiki/concepts/agent.md",
+            "---\ntitle: Agent Runtime\n---\n\n# Agent Runtime\n\nagent runtime details. [[Tool Registry]]",
+        );
+        write_page(
+            &root,
+            "wiki/concepts/tool-registry.md",
+            "---\ntitle: Tool Registry\n---\n\n# Tool Registry\n\nDefines callable tools.",
+        );
+        write_page(
+            &root,
+            "wiki/concepts/unrelated.md",
+            "---\ntitle: Unrelated\n---\n\n# Unrelated\n\nNo graph connection.",
+        );
+
+        let out = search_project_inner(
+            root.to_string_lossy().to_string(),
+            "agent runtime".into(),
+            10,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.mode, "hybrid");
+        assert_eq!(out.graph_hits, 1);
+        assert!(out
+            .results
+            .iter()
+            .any(|result| result.title == "Agent Runtime"));
+        assert!(out.results.iter().any(|result| {
+            result.title == "Tool Registry"
+                && result.snippet.contains("Graph neighbor")
+                && result.graph_related_to == vec!["Agent Runtime"]
+        }));
+        assert!(!out.results.iter().any(|result| result.title == "Unrelated"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn page_links_resolve_outgoing_backlinks_and_missing_targets() {
+        let root = tmp_project();
+        write_page(
+            &root,
+            "wiki/concepts/Alpha.md",
+            "---\ntitle: Alpha\n---\n# Alpha\n\n[[Beta|label]], [[Alpha]], [[Title Only]], and [[Missing Page]].",
+        );
+        write_page(
+            &root,
+            "wiki/concepts/Beta.md",
+            "---\ntitle: Beta\n---\n# Beta\n\nBeta details.",
+        );
+        write_page(
+            &root,
+            "wiki/concepts/different-filename.md",
+            "---\ntitle: Title Only\n---\n# Title Only\n",
+        );
+        write_page(
+            &root,
+            "wiki/concepts/gamma.md",
+            "---\ntitle: Gamma\n---\n# Gamma\n\nGamma references [[Alpha]] here.",
+        );
+
+        let links = get_page_links_inner(
+            root.to_str().unwrap(),
+            root.join("wiki/concepts/Alpha.md").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(links.outgoing.len(), 1);
+        assert_eq!(links.outgoing[0].title, "Beta");
+        assert_eq!(links.backlinks.len(), 1);
+        assert_eq!(links.backlinks[0].title, "Gamma");
+        assert!(links.backlinks[0]
+            .snippet
+            .as_deref()
+            .unwrap()
+            .contains("Alpha"));
+        assert_eq!(links.missing.len(), 2);
+        assert!(links
+            .missing
+            .iter()
+            .any(|entry| entry.title == "Missing Page"));
+        assert!(links
+            .missing
+            .iter()
+            .any(|entry| entry.title == "Title Only"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn page_links_require_markdown_input_and_exact_reader_paths() {
+        let root = tmp_project();
+        write_page(
+            &root,
+            "wiki/concepts/current.md",
+            "[[wiki/concepts/target.md]] [[target#section]]",
+        );
+        write_page(&root, "wiki/concepts/target.md", "# Target");
+        write_page(&root, "wiki/concepts/not-markdown.txt", "text");
+
+        let links = get_page_links_inner(
+            root.to_str().unwrap(),
+            root.join("wiki/concepts/current.md").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(links.outgoing.len(), 1);
+        assert_eq!(
+            links.outgoing[0].path.as_deref(),
+            Some("wiki/concepts/target.md")
+        );
+        assert_eq!(links.missing.len(), 1);
+        assert_eq!(links.missing[0].title, "target#section");
+
+        let error = get_page_links_inner(
+            root.to_str().unwrap(),
+            root.join("wiki/concepts/not-markdown.txt")
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("Markdown"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn keyword_search_handles_cjk_bigram_queries() {
         let root = tmp_project();
         write_page(
@@ -1114,5 +2216,29 @@ mod tests {
 
         assert_eq!(out.results[0].title, "Phrase");
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn parses_openai_batch_vectors_in_input_order() {
+        let response = json!({
+            "data": [
+                { "index": 1, "embedding": [2.0, 2.5] },
+                { "index": 0, "embedding": [1.0, 1.5] }
+            ]
+        });
+        let vectors = parse_embedding_batch_values(&response, 2).unwrap();
+        assert_eq!(vectors, vec![vec![1.0, 1.5], vec![2.0, 2.5]]);
+    }
+
+    #[test]
+    fn rejects_duplicate_openai_batch_indexes() {
+        let response = json!({
+            "data": [
+                { "index": 0, "embedding": [1.0] },
+                { "index": 0, "embedding": [2.0] }
+            ]
+        });
+        assert!(parse_embedding_batch_values(&response, 2)
+            .unwrap_err()
+            .contains("duplicate"));
     }
 }

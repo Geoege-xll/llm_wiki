@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-  English | <a href="README_CN.md">中文</a> | <a href="README_JA.md">日本語</a>
+  English | <a href="README_CN.md">中文</a> | <a href="README_JA.md">日本語</a> | <a href="README_KO.md">한국어</a>
 </p>
 
 ---
@@ -32,6 +32,10 @@
 
 - **Two-Step Chain-of-Thought Ingest** — LLM analyzes first, then generates wiki pages with source traceability and incremental cache
 - **Multimodal Image Ingestion** — extract embedded images from PDFs, generate factual captions with a vision LLM, surface them in image-aware search results with lightbox preview and jump-to-source
+- **Multi-format Document Parsing** — ingest PDF, Office documents, EPUB/MOBI, Org mode, images, media, web clips, and batches of URLs, with built-in, cloud, or local MinerU PDF processing
+- **Flexible Model Configuration** — configure models per project, route Chat and Ingest independently, and manage custom providers, headers, and streaming output
+- **Source-grounded Retrieval** — use Read Sources Only mode to answer exclusively from original imported material
+- **Project Management & Migration** — export and import complete project archives across devices, and rebuild the Wiki index from existing pages
 - **4-Signal Knowledge Graph** — relevance model with direct links, source overlap, Adamic-Adar, and type affinity
 - **Louvain Community Detection** — automatic knowledge cluster discovery with cohesion scoring
 - **Graph Insights** — surprising connections and knowledge gaps with one-click Deep Research
@@ -40,15 +44,19 @@
 - **Folder Import** — recursive folder import preserving directory structure, folder context as LLM classification hint
 - **Source Folder Auto-Watch** — detects external changes in `raw/sources/` and keeps ingest/delete cleanup in sync
 - **Deep Research** — LLM-optimized search topics, multi-query web search via Tavily, SerpApi, or SearXNG, auto-ingest results into wiki
+- **Rust Backend Chat Agent** — tool-using chat runtime with wiki/source/graph/web retrieval, workspace file generation, shell approval, cancellation, and streaming tool events
+- **Agent Skills** — scan and enable local `SKILL.md` folders, select skills with `/skill`, and let the Agent read skill instructions on demand
+- **Generated Outputs Preview** — Agent-created Markdown, HTML, images, and other workspace files appear as outputs with preview and quick folder access
+- **Mermaid Diagram Rendering** — render Mermaid code blocks directly in chat and preview, with compact syntax-error cards instead of raw parser output
 - **Async Review System** — LLM flags items for human judgment, predefined actions, pre-generated search queries
 - **Chrome Web Clipper** — one-click web page capture with auto-ingest into knowledge base
-- **Local HTTP API + AI Agent Skill** — built-in `127.0.0.1:19828` JSON API (token-protected) for hybrid search, file read, graph traversal, and source rescan; ready-made [agent skill](https://github.com/nashsu/llm_wiki_skill) installs into Claude Code / Codex with one command (`npx skills add …`)
+- **Local HTTP API + MCP Server + AI Agent Skill** — built-in `127.0.0.1:19828` JSON API and bundled MCP server for hybrid search, file read, graph traversal, and source rescan; ready-made [agent skill](https://github.com/nashsu/llm_wiki_skill) installs into Claude Code / Codex with one command (`npx skills add …`)
 
 ## What is this?
 
 LLM Wiki is a cross-platform desktop application that turns your documents into an organized, interlinked knowledge base — automatically. Instead of traditional RAG (retrieve-and-answer from scratch every time), the LLM **incrementally builds and maintains a persistent wiki** from your sources. Knowledge is compiled once and kept current, not re-derived on every query.
 
-This project is based on [Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) — a methodology for building personal knowledge bases using LLMs. We implemented the core ideas as a full desktop application with significant enhancements.
+This project is based on [Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) — a methodology for building personal knowledge bases using LLMs. llm_wiki is created and maintained by [nash_su](https://x.com/nash_su), who implemented the core ideas as a full desktop application with significant enhancements.
 
 <p align="center">
   <img src="assets/llm_wiki_arch.jpg" width="100%" alt="LLM Wiki Architecture">
@@ -236,7 +244,17 @@ The original has a single query interface. We built **full multi-conversation su
 - **Regenerate** — re-generate the last response with one click (removes last assistant + user message pair, re-sends)
 - **Save to Wiki** — archive valuable answers to `wiki/queries/`, then auto-ingest to extract entities/concepts into the knowledge network
 
-### 9. Thinking / Reasoning Display
+### 9. Rust Backend Chat Agent & Skills
+
+Not in the original. Chat now runs through a Rust backend Agent runtime rather than a browser-only TypeScript loop:
+
+- **Tool-using Agent** — can choose wiki search, source search, graph search, web search, AnyTXT, workspace file tools, approved shell commands, and skill file reads
+- **Skill management** — scan project and user skill folders, enable or disable skills, and pick a skill per conversation with `/skill` completion
+- **Generated workspace outputs** — files produced by Agent tools are kept under `agent-workspace/`, shown as generated outputs, and can be previewed or opened from the chat
+- **User interaction forms** — skills can ask for structured user input such as single choice, multiple choice, or free text without hardcoding skill-specific UI
+- **Safer execution model** — project workspace commands can continue smoothly, while external shell commands still require explicit approval
+
+### 10. Thinking / Reasoning Display
 
 Not in the original. For LLMs that emit `<think>` blocks (DeepSeek, QwQ, etc.):
 
@@ -244,16 +262,18 @@ Not in the original. For LLMs that emit `<think>` blocks (DeepSeek, QwQ, etc.):
 - **Collapsed by default** — thinking blocks hidden after completion, click to expand
 - **Visual separation** — thinking content shown in distinct style, separate from the main response
 
-### 10. KaTeX Math Rendering
+### 11. Markdown Rendering: KaTeX Math & Mermaid Diagrams
 
-Not in the original. Full LaTeX math support across all views:
+Not in the original. Rich Markdown rendering across chat and preview:
 
 - **KaTeX rendering** — inline `$...$` and block `$$...$$` formulas rendered via remark-math + rehype-katex
 - **Milkdown math plugin** — preview editor renders math natively via @milkdown/plugin-math
 - **Auto-detection** — bare `\begin{aligned}` and other LaTeX environments automatically wrapped with `$$` delimiters
 - **Unicode fallback** — 100+ symbol mappings (α, ∑, →, ≤, etc.) for simple inline notation outside math blocks
+- **Mermaid code blocks** — fenced `mermaid` diagrams render directly as flowcharts, sequence diagrams, and other Mermaid-supported visuals
+- **Compact Mermaid errors** — syntax failures are captured inside a small error card instead of spilling raw parser output into the chat
 
-### 11. Review System (Async Human-in-the-Loop)
+### 12. Review System (Async Human-in-the-Loop)
 
 The original suggests staying involved during ingest. We added an **asynchronous review queue**:
 
@@ -262,7 +282,7 @@ The original suggests staying involved during ingest. We added an **asynchronous
 - **Search queries generated at ingest time** — LLM pre-generates optimized web search queries for each review item
 - User handles reviews at their convenience — doesn't block ingest
 
-### 12. Deep Research
+### 13. Deep Research
 
 <p align="center">
   <img src="assets/1-deepresearch.jpg" width="100%" alt="Deep Research">
@@ -281,7 +301,7 @@ Not in the original. When the LLM identifies knowledge gaps:
 - **Task queue** with 3 concurrent tasks
 - **Research Panel** — dedicated sidebar panel with dynamic height, real-time streaming progress
 
-### 13. Browser Extension (Web Clipper)
+### 14. Browser Extension (Web Clipper)
 
 <p align="center">
   <img src="assets/4-chrome_extension_webclipper.jpg" width="100%" alt="Chrome Extension Web Clipper">
@@ -297,21 +317,24 @@ The original mentions Obsidian Web Clipper. We built a **dedicated Chrome Extens
 - **Clip watcher** — polls every 3 seconds for new clips, processes automatically
 - **Offline preview** — shows extracted content even when app is not running
 
-### 14. Multi-format Document Support
+### 15. Multi-format Document Support
 
 The original focuses on text/markdown. We support structured extraction preserving document semantics:
 
 | Format | Method |
 |--------|--------|
-| PDF | pdf-extract (Rust) with file caching |
+| PDF | Built-in pdf-extract (Rust) with file caching; optional MinerU Cloud, Local API, or Pipeline parsing for complex layouts |
 | DOCX | docx-rs — headings, bold/italic, lists, tables → structured Markdown |
 | PPTX | ZIP + XML — slide-by-slide extraction with heading/list structure |
 | XLSX/XLS/ODS | calamine — proper cell types, multi-sheet support, Markdown tables |
+| EPUB/MOBI | Electronic book metadata, chapters, and body text → ingest-ready content |
 | Images | Native preview (png, jpg, gif, webp, svg, etc.) |
 | Video/Audio | Built-in player |
 | Web clips | Readability.js + Turndown.js → clean Markdown |
 
-### 15. File Deletion with Cascade Cleanup
+> MinerU is optional. Use MinerU Cloud, an official Local API endpoint, or Local Pipeline mode for complex PDFs. Local modes keep processing on your machine, and extracted images are stored in the project-managed `wiki/media` directory. If MinerU fails, LLM Wiki falls back to the built-in parser.
+
+### 16. File Deletion with Cascade Cleanup
 
 The original has no deletion mechanism. We added **intelligent cascade deletion**:
 
@@ -321,7 +344,7 @@ The original has no deletion mechanism. We added **intelligent cascade deletion*
 - **Index cleanup** — removed pages are purged from index.md
 - **Wikilink cleanup** — dead `[[wikilinks]]` to deleted pages are removed from remaining wiki pages
 
-### 16. Configurable Context Window
+### 17. Configurable Context Window
 
 Not in the original. Users can configure how much context the LLM receives:
 
@@ -329,7 +352,7 @@ Not in the original. Users can configure how much context the LLM receives:
 - **Proportional budget allocation** — larger windows get proportionally more wiki content
 - **60/20/5/15 split** — wiki pages / chat history / index / system prompt
 
-### 17. Cross-Platform Compatibility
+### 18. Cross-Platform Compatibility
 
 The original is platform-agnostic (abstract pattern). We handle concrete cross-platform concerns:
 
@@ -340,14 +363,17 @@ The original is platform-agnostic (abstract pattern). We handle concrete cross-p
 - **Tauri v2** — native desktop on macOS, Windows, Linux
 - **GitHub Actions CI/CD** — automated builds for macOS (ARM + Intel), Windows (.msi), Linux (.deb / .AppImage)
 
-### 18. Other Additions
+### 19. Other Additions
 
 - **i18n** — English + Chinese interface (react-i18next)
 - **Settings persistence** — LLM provider, API key, model, context size, language saved via Tauri Store
 - **Obsidian config** — auto-generated `.obsidian/` directory with recommended settings
 - **Markdown rendering** — GFM tables with borders, proper code blocks, wikilink processing in chat and preview
 - **Multi-provider LLM support** — OpenAI, Anthropic, Google, Ollama, Custom — each with provider-specific streaming and headers
-- **15-minute timeout** — long ingest operations won't fail prematurely
+- **Configurable LLM timeout** — adjust request timeouts for slow local models and long-running operations
+- **Configurable Firecrawl** — optional API key and custom Base URL for hosted or self-hosted services
+- **Collapsible file sidebar** — collapse Knowledge/Files navigation while preserving its state
+- **Project maintenance** — ZIP export/import for migration and deterministic `wiki/index.md` rebuilding
 - **dataVersion signaling** — graph and UI automatically refresh when wiki content changes
 
 ## Tech Stack
@@ -361,8 +387,7 @@ The original is platform-agnostic (abstract pattern). We handle concrete cross-p
 | Graph | sigma.js + graphology + ForceAtlas2 |
 | Search | Tokenized search + graph relevance + optional vector (LanceDB) |
 | Vector DB | LanceDB (Rust, embedded, optional) |
-| PDF | pdf-extract |
-| Office | docx-rs + calamine |
+| Documents | pdf-extract + MinerU Cloud/Local + docx-rs + calamine + EPUB/MOBI extraction |
 | i18n | react-i18next |
 | State | Zustand |
 | LLM | Streaming fetch (OpenAI, Anthropic, Google, Ollama, Custom) |
@@ -394,6 +419,7 @@ npm run tauri build    # Production build
 2. Enable "Developer mode"
 3. Click "Load unpacked"
 4. Select the `extension/` directory
+5. Clip the current page with `Alt+Shift+L` (`Command+Shift+L` on macOS). Customize it at `chrome://extensions/shortcuts`.
 
 ## Quick Start
 
@@ -407,25 +433,31 @@ npm run tauri build    # Production build
 8. Check **Review** for items needing your attention
 9. Run **Lint** periodically to maintain wiki health
 
-## Local HTTP API + AI Agent Skill
+## Local HTTP API + MCP Server + AI Agent Skill
 
 LLM Wiki ships a built-in local HTTP API at `http://127.0.0.1:19828` (token-protected, `127.0.0.1`-only) so external tools — including AI agents like **Claude Code**, **Codex**, or any HTTP-capable script — can query your wiki:
 
 - `GET /api/v1/health` — server status (no auth)
 - `GET /api/v1/projects` — list projects
 - `GET /api/v1/projects/{id}/files` / `files/content` — read files and content
+- `GET /api/v1/projects/{id}/reviews?status=unresolved` — export Review tab items for wiki maintenance (`status`: `unresolved`, `resolved`, or `all`; optional `type` and `limit`)
+- `PATCH /api/v1/projects/{id}/reviews/{reviewId}` — update one Review item (JSON body `{ "resolved": true, "action": "label" }`; `resolved` defaults to true, pass false to reopen)
+- `POST /api/v1/projects/{id}/reviews/resolve` — bulk-resolve Review items (JSON body `{ "ids": [...], "action": "label" }`), returns `{ resolved, notFound, count }`; the Review tab's Refresh button re-reads the result from disk
 - `POST /api/v1/projects/{id}/search` — **hybrid** retrieval (keyword + vector) returning `mode`, `tokenHits`, `vectorHits`, per-result `vectorScore`
+- `POST /api/v1/projects/{id}/chat` — non-streaming backend Agent chat endpoint returning an assistant message, references, usage, and tool events for wiki/source/web/AnyTXT retrieval; `mode: "deep"` broadens evidence collection, while the full Deep Research workspace remains available in the desktop UI
 - `GET /api/v1/projects/{id}/graph` — wikilinks graph
 - `POST /api/v1/projects/{id}/sources/rescan` — trigger a backend rescan
 
-Enable + generate a token in **Settings → API Server**.
+Enable the API, generate a token, and choose whether local unauthenticated access is allowed in **Settings → API + MCP**.
+
+For MCP-compatible clients, LLM Wiki also includes a local MCP server in `mcp-server/`. After building it with `npm run mcp:build`, **Settings → API + MCP** shows a copyable MCP client configuration with the correct local path for your machine. The MCP tools call the same API surface, so agent clients can list projects, read files, export unresolved Review items, run hybrid search, inspect the graph, trigger source rescans, and call the same Rust backend Agent chat endpoint without custom HTTP glue code.
 
 ### Plug your AI agent in with one command
 
 A ready-made **agent skill** for LLM Wiki lives in its own repo. Install it into Claude Code / Codex / any skills-compatible runtime:
 
 ```bash
-npx skills add https://github.com/nashsu/llm_wiki_skill.git --skill llm_wiki_skill
+npx skills add https://github.com/nashsu/llm_wiki_skill.git --skill llm-wiki
 ```
 
 After install, the agent can answer prompts like "what does my LLM Wiki say about X", "search my 知识库 for Y", "show the neighborhood of node Z in my wiki graph", and "rescan my wiki sources" by talking to your locally-running app — read-only by default, citing wiki page paths so you can verify in-app.

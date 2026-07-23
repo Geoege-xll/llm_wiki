@@ -31,6 +31,13 @@ jobs:
             rust_target: ''
 
     runs-on: ${{ matrix.platform }}
+    env:
+      # GitHub-hosted runners occasionally hit crates.io HTTP/2 stream
+      # resets while downloading large dependency graphs. Cargo retries plus
+      # HTTP/1.1 transport make release builds less flaky across the matrix.
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "5"
+      CARGO_HTTP_TIMEOUT: "60"
 
     steps:
       - name: Checkout
@@ -41,8 +48,13 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - name: Install protoc (macOS)
-        if: matrix.platform == 'macos-latest'
+        if: startsWith(matrix.platform, 'macos-')
         run: brew install protobuf
 
       - name: Install dependencies (Ubuntu)
@@ -58,13 +70,19 @@ jobs:
 
       # The repo ships pre-downloaded PDFium binaries under
       # src-tauri/pdfium/ for every supported architecture
-      # (libpdfium.so = x86_64, libpdfium-arm64.so = aarch64,
-      # libpdfium.dylib = macOS, pdfium.dll = Windows). On the
-      # ARM Linux runner we swap libpdfium.so to the aarch64 build
-      # before tauri-action runs cargo. We do NOT pull from
-      # bblanchon/pdfium-binaries during CI — that download has
-      # historically failed often enough that committing the
+      # (libpdfium.so = Linux x86_64, libpdfium-arm64.so = Linux aarch64,
+      # libpdfium.dylib = macOS arm64, pdfium.dll = Windows).
+      # For architectures whose bundled filename must
+      # stay `libpdfium.*`, swap the matching binary into place before cargo
+      # runs. We do NOT pull from bblanchon/pdfium-binaries during CI — that
+      # download has historically failed often enough that committing the
       # binaries is the maintenance-friendly path.
+      - name: Verify PDFium binary checksums
+        if: matrix.platform != 'windows-latest'
+        run: shasum -a 256 -c src-tauri/pdfium/SHA256SUMS
+
+      # rust_target is empty for both Ubuntu rows, so platform is the
+      # only stable discriminator for the Linux ARM swap.
       - name: Use ARM64 pdfium binary (Ubuntu ARM only)
         if: matrix.platform == 'ubuntu-22.04-arm'
         run: |
@@ -84,6 +102,11 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm install
+
+      - name: Prepare MCP server resources
+        run: |
+          npm --prefix mcp-server ci
+          npm run mcp:build
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
@@ -108,6 +131,21 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
+      - name: Package Windows portable zip
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $version = node -p "require('./package.json').version"
+          .github/scripts/package-windows-portable.ps1 -Version $version
+
+      - name: Attach Windows portable zip to release
+        if: github.event_name == 'push' && matrix.platform == 'windows-latest'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release upload "${{ github.ref_name }}" dist-portable/*.zip --clobber
+
       # On workflow_dispatch, no release is created, so the bundles
       # would otherwise be discarded with the runner. Upload them as
       # workflow artifacts so the maintainer can `gh run download`
@@ -127,6 +165,7 @@ jobs:
             src-tauri/target/**/release/bundle/dmg/*.dmg
             src-tauri/target/**/release/bundle/deb/*.deb
             src-tauri/target/**/release/bundle/appimage/*.AppImage
+            dist-portable/*.zip
           if-no-files-found: warn
           retention-days: 14
 

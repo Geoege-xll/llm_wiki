@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react"
 import { useTranslation } from "react-i18next"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -10,7 +10,9 @@ import {
   embedAllPages,
   getEmbeddingCount,
   getLastEmbeddingError,
+  getEmbeddingReindexState,
   legacyVectorRowCount,
+  subscribeEmbeddingReindexState,
 } from "@/lib/embedding"
 import { testEmbeddingConnection, testEmbeddingFunction, type ProviderTestResult } from "@/lib/connection-tests"
 import type { SettingsDraft, DraftSetter } from "../settings-types"
@@ -19,11 +21,6 @@ interface Props {
   draft: SettingsDraft
   setDraft: DraftSetter
 }
-
-type ReindexState =
-  | { kind: "idle" }
-  | { kind: "running"; done: number; total: number }
-  | { kind: "done"; count: number }
 
 type TestState =
   | { kind: "idle" }
@@ -38,6 +35,48 @@ function parsePositiveInteger(value: string): number | undefined {
   return Math.floor(n)
 }
 
+const RESERVED_HEADER_NAMES = new Set([
+  "authorization",
+  "content-type",
+  "host",
+  "content-length",
+  "x-goog-api-key",
+])
+const HTTP_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
+const EMBEDDING_MODEL_SUGGESTIONS = [
+  "text-embedding-3-small",
+  "text-embedding-3-large",
+  "gemini-embedding-001",
+  "gemini-embedding-2",
+  "text-embedding-004",
+  "doubao-embedding-vision",
+  "doubao-embedding-text-240715",
+  "text-embedding-qwen3-embedding-0.6b",
+  "nomic-embed-text",
+  "mxbai-embed-large",
+]
+
+function headersToText(headers: Record<string, string>): string {
+  return Object.entries(headers)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join("\n")
+}
+
+function parseHeadersText(text: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith("#")) continue
+    const idx = line.indexOf(":")
+    if (idx <= 0) continue
+    const name = line.slice(0, idx).trim()
+    const value = line.slice(idx + 1).trim()
+    if (!name || !value || !HTTP_HEADER_NAME_RE.test(name) || RESERVED_HEADER_NAMES.has(name.toLowerCase())) continue
+    out[name] = value
+  }
+  return out
+}
+
 export function EmbeddingSection({ draft, setDraft }: Props) {
   const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
@@ -46,9 +85,18 @@ export function EmbeddingSection({ draft, setDraft }: Props) {
   const [chunkCount, setChunkCount] = useState<number | null>(null)
   const [legacyCount, setLegacyCount] = useState<number>(0)
   const [lastError, setLastError] = useState<string | null>(null)
-  const [reindex, setReindex] = useState<ReindexState>({ kind: "idle" })
+  const sharedReindex = useSyncExternalStore(
+    subscribeEmbeddingReindexState,
+    getEmbeddingReindexState,
+  )
+  const reindex = "projectPath" in sharedReindex
+    && project
+    && sharedReindex.projectPath === project.path.replace(/\\/g, "/")
+    ? sharedReindex
+    : { kind: "idle" as const }
   const [testState, setTestState] = useState<TestState>({ kind: "idle" })
   const [legacyDropped, setLegacyDropped] = useState(false)
+  const [headersText, setHeadersText] = useState<string>(() => headersToText(draft.embeddingExtraHeaders ?? {}))
 
   const refreshStats = useCallback(async () => {
     if (!project) return
@@ -71,12 +119,17 @@ export function EmbeddingSection({ draft, setDraft }: Props) {
 
   const handleReindex = useCallback(async () => {
     if (!project) return
-    setReindex({ kind: "running", done: 0, total: 0 })
-    const count = await embedAllPages(project.path, embeddingConfig, (done, total) => {
-      setReindex({ kind: "running", done, total })
-    })
-    setReindex({ kind: "done", count })
-    await refreshStats()
+    try {
+      await embedAllPages(
+        project.path,
+        embeddingConfig,
+        undefined,
+        { clearExisting: true },
+      )
+      await refreshStats()
+    } catch (err) {
+      await refreshStats()
+    }
   }, [project, embeddingConfig, refreshStats])
 
   const handleDropLegacy = useCallback(async () => {
@@ -94,6 +147,9 @@ export function EmbeddingSection({ draft, setDraft }: Props) {
     outputDimensionality: draft.embeddingOutputDimensionality,
     maxChunkChars: draft.embeddingMaxChunkChars,
     overlapChunkChars: draft.embeddingOverlapChunkChars,
+    concurrency: draft.embeddingConcurrency,
+    batchSize: draft.embeddingBatchSize,
+    extraHeaders: draft.embeddingExtraHeaders,
   }
 
   async function runEmbeddingTest(kind: "connection" | "function") {
@@ -173,8 +229,17 @@ export function EmbeddingSection({ draft, setDraft }: Props) {
             <Input
               value={draft.embeddingModel}
               onChange={(e) => setDraft("embeddingModel", e.target.value)}
+              list="embedding-model-suggestions"
               placeholder="e.g. text-embedding-qwen3-embedding-0.6b or gemini-embedding-001"
             />
+            <datalist id="embedding-model-suggestions">
+              {EMBEDDING_MODEL_SUGGESTIONS.map((model) => (
+                <option key={model} value={model} />
+              ))}
+            </datalist>
+            <p className="text-xs text-muted-foreground">
+              {t("settings.sections.embedding.modelHint")}
+            </p>
           </div>
 
           <div className="space-y-2">
@@ -191,6 +256,24 @@ export function EmbeddingSection({ draft, setDraft }: Props) {
             />
             <p className="text-xs text-muted-foreground">
               {t("settings.sections.embedding.outputDimensionalityHint")}
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <Label>{t("settings.sections.embedding.extraHeaders")}</Label>
+            <textarea
+              value={headersText}
+              onChange={(e) => {
+                const text = e.target.value
+                setHeadersText(text)
+                setDraft("embeddingExtraHeaders", parseHeadersText(text))
+              }}
+              placeholder={"X-Model-Provider-Id: siliconflow\nX-Custom-Header: value"}
+              rows={3}
+              className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            />
+            <p className="text-xs text-muted-foreground">
+              {t("settings.sections.embedding.extraHeadersHint")}
             </p>
           </div>
 
@@ -239,6 +322,43 @@ export function EmbeddingSection({ draft, setDraft }: Props) {
               <p className="text-xs text-muted-foreground">
                 {t("settings.sections.embedding.overlapChunkCharsHint")}
               </p>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label>{t("settings.sections.embedding.concurrency")}</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={32}
+                  step={1}
+                  value={draft.embeddingConcurrency}
+                  onChange={(e) => setDraft(
+                    "embeddingConcurrency",
+                    Math.max(1, Math.min(32, Number(e.target.value) || 1)),
+                  )}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("settings.sections.embedding.concurrencyHint")}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label>{t("settings.sections.embedding.batchSize")}</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={64}
+                  step={1}
+                  value={draft.embeddingBatchSize}
+                  onChange={(e) => setDraft(
+                    "embeddingBatchSize",
+                    Math.max(1, Math.min(64, Number(e.target.value) || 1)),
+                  )}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("settings.sections.embedding.batchSizeHint")}
+                </p>
+              </div>
             </div>
           </div>
 
@@ -334,6 +454,12 @@ export function EmbeddingSection({ draft, setDraft }: Props) {
             {reindex.kind === "done" && (
               <p className="text-xs text-muted-foreground">
                 {t("settings.sections.embedding.reindexDone", { count: reindex.count })}
+              </p>
+            )}
+
+            {reindex.kind === "error" && (
+              <p className="text-xs text-destructive">
+                {t("settings.sections.embedding.reindexError", { message: reindex.message })}
               </p>
             )}
 

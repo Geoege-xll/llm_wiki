@@ -1,5 +1,49 @@
 import type { FileNode } from "@/types/wiki"
 
+export interface ProjectPathIndexEntry {
+  name: string
+  path: string
+}
+
+export interface ProjectPathIndex {
+  byPath: ReadonlyMap<string, ProjectPathIndexEntry>
+  filesByName: ReadonlyMap<string, readonly ProjectPathIndexEntry[]>
+}
+
+export function createEmptyProjectPathIndex(): ProjectPathIndex {
+  return { byPath: new Map(), filesByName: new Map() }
+}
+
+export function buildProjectPathIndexFromTree(tree: FileNode[]): ProjectPathIndex {
+  const byPath = new Map<string, ProjectPathIndexEntry>()
+  const filesByName = new Map<string, ProjectPathIndexEntry[]>()
+
+  function walk(nodes: FileNode[]) {
+    for (const node of nodes) {
+      // Callers may pass overlapping trees (e.g. the full project
+      // scan plus a hidden `raw/sources` rescan share the visible
+      // source files). Index each path once so `filesByName` buckets
+      // don't accumulate duplicate entries.
+      if (!byPath.has(node.path)) {
+        const entry: ProjectPathIndexEntry = {
+          name: node.name,
+          path: node.path,
+        }
+        byPath.set(node.path, entry)
+        if (!node.is_dir) {
+          const bucket = filesByName.get(node.name)
+          if (bucket) bucket.push(entry)
+          else filesByName.set(node.name, [entry])
+        }
+      }
+      if (node.is_dir && node.children) walk(node.children)
+    }
+  }
+
+  walk(tree)
+  return { byPath, filesByName }
+}
+
 /**
  * Strip Obsidian-style `[[target]]` or `[[target|alias]]` wrapping
  * from a value, returning `{ slug, label }`. Frontmatter authors
@@ -17,41 +61,48 @@ export function unwrapWikilink(s: string): { slug: string; label: string } {
   return { slug: target, label: alias && alias.length > 0 ? alias : target }
 }
 
+export type SourceReferenceResolution =
+  | { kind: "external"; url: string }
+  | { kind: "local"; path: string }
+  | { kind: "missing" }
+
+export function resolveSourceReference(
+  index: ProjectPathIndex,
+  ref: string,
+  sourcesRoot: string | null,
+): SourceReferenceResolution {
+  const trimmedRef = ref.trim()
+  const externalUrl = normalizeHttpUrl(trimmedRef)
+  if (externalUrl) return { kind: "external", url: externalUrl }
+  if (!sourcesRoot) return { kind: "missing" }
+
+  const path = resolveSourceName(index, trimmedRef, sourcesRoot)
+  return path ? { kind: "local", path } : { kind: "missing" }
+}
+
 /**
- * Walk a FileNode tree and return the absolute path of the first
- * file whose name matches `targetName`, restricted to subtrees that
- * sit underneath any directory whose absolute path contains
- * `pathContains`. Returns null when nothing matches.
+ * Return the absolute path of the first indexed file whose basename
+ * matches `targetName` and whose path contains `pathContains`.
+ * Returns null when nothing matches.
  *
  * Used by the frontmatter panel to resolve `related: [slug]` to a
  * concrete `wiki/.../<slug>.md` path so a chip can navigate, and
  * `sources: [name.pdf]` to a `raw/sources/.../name.pdf` path so a
  * card can open the raw file. We intentionally take the first
- * match — duplicate basenames across subfolders are a wiki-author
- * collision the user sees in the file tree anyway, and resolving
- * arbitrarily is no worse than the prior text-only display.
+ * match in the original FileNode DFS order — duplicate basenames
+ * across subfolders are a wiki-author collision the user sees in
+ * the file tree anyway, and resolving arbitrarily is no worse than
+ * the prior text-only display.
  */
 export function findInTreeByName(
-  tree: FileNode[],
+  index: ProjectPathIndex,
   targetName: string,
   pathContains: string,
 ): string | null {
-  function walk(nodes: FileNode[]): string | null {
-    for (const node of nodes) {
-      if (node.is_dir) {
-        if (node.children) {
-          const r = walk(node.children)
-          if (r) return r
-        }
-        continue
-      }
-      if (node.name === targetName && node.path.includes(pathContains)) {
-        return node.path
-      }
-    }
-    return null
+  for (const entry of index.filesByName.get(targetName) ?? []) {
+    if (entry.path.includes(pathContains)) return entry.path
   }
-  return walk(tree)
+  return null
 }
 
 /**
@@ -65,7 +116,7 @@ export function findInTreeByName(
  * in a same-named file from `raw/sources/`.
  */
 export function resolveRelatedSlug(
-  tree: FileNode[],
+  index: ProjectPathIndex,
   ref: string,
   wikiRoot: string,
 ): string | null {
@@ -74,12 +125,12 @@ export function resolveRelatedSlug(
   if (ref.includes("/")) {
     const projectRoot = wikiRoot.replace(/\/wiki$/, "")
     const target = `${projectRoot}/${ref}`
-    const found = findInTreeByPath(tree, target)
+    const found = findInTreeByPath(index, target)
     return found && found.includes(`${wikiRoot}/`) ? found : null
   }
 
   const filename = ref.endsWith(".md") ? ref : `${ref}.md`
-  return findInTreeByName(tree, filename, `${wikiRoot}/`)
+  return findInTreeByName(index, filename, `${wikiRoot}/`)
 }
 
 /**
@@ -93,7 +144,7 @@ export function resolveRelatedSlug(
  * back to raw/sources/. Returns null if nothing matches.
  */
 export function resolveSourceName(
-  tree: FileNode[],
+  index: ProjectPathIndex,
   ref: string,
   sourcesRoot: string,
 ): string | null {
@@ -113,7 +164,7 @@ export function resolveSourceName(
         ]
 
     for (const target of candidates) {
-      const found = findInTreeByPath(tree, target)
+      const found = findInTreeByPath(index, target)
       if (found) return found
     }
     return null
@@ -122,24 +173,27 @@ export function resolveSourceName(
   // Bare .md filename → look in wiki/sources/ first (ingest's
   // canonical home for source-summary pages).
   if (ref.endsWith(".md")) {
-    const inWiki = findInTreeByName(tree, ref, `${wikiSources}/`)
+    const inWiki = findInTreeByName(index, ref, `${wikiSources}/`)
     if (inWiki) return inWiki
   }
 
   // Otherwise, search raw/sources/.
-  return findInTreeByName(tree, ref, `${sourcesRoot}/`)
+  return findInTreeByName(index, ref, `${sourcesRoot}/`)
 }
 
-function findInTreeByPath(tree: FileNode[], targetPath: string): string | null {
-  function walk(nodes: FileNode[]): string | null {
-    for (const node of nodes) {
-      if (node.path === targetPath) return node.path
-      if (node.is_dir && node.children) {
-        const r = walk(node.children)
-        if (r) return r
-      }
-    }
+function findInTreeByPath(index: ProjectPathIndex, targetPath: string): string | null {
+  const found = index.byPath.get(targetPath)
+  return found?.path ?? null
+}
+
+function normalizeHttpUrl(ref: string): string | null {
+  if (/[\u0000-\u001f\u007f]/u.test(ref)) return null
+  try {
+    const url = new URL(ref)
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null
+    if (!url.hostname || url.username || url.password) return null
+    return url.href
+  } catch {
     return null
   }
-  return walk(tree)
 }

@@ -16,8 +16,9 @@
  *      `{id, score}[]` shape; matched chunks available on the
  *      optional `matchedChunks` field for future UI surfacing.
  *
- * HTTP goes through the Tauri plugin (`src/lib/tauri-fetch.ts`) so
- * CORS-unfriendly endpoints work the same as the LLM path.
+ * Provider HTTP is executed by the Rust `embedding_fetch` command so
+ * CORS-unfriendly endpoints keep working while the core embedding
+ * transport is shared by UI and backend callers.
  */
 
 import { readFile, listDirectory } from "@/commands/fs"
@@ -25,8 +26,8 @@ import { invoke } from "@tauri-apps/api/core"
 import type { EmbeddingConfig } from "@/stores/wiki-store"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
-import { getHttpFetch, isFetchNetworkError } from "@/lib/tauri-fetch"
 import { chunkMarkdown, type Chunk } from "@/lib/text-chunker"
+import { parseFrontmatter } from "@/lib/frontmatter"
 
 // ── Error surfacing ──────────────────────────────────────────────────────
 
@@ -37,9 +38,18 @@ import { chunkMarkdown, type Chunk } from "@/lib/text-chunker"
  * embed.
  */
 let lastEmbeddingError: string | null = null
+let embeddingFailureVersion = 0
+const INCREMENTAL_OPTIMIZE_PAGE_THRESHOLD = 20
+const incrementalOptimizeCounts = new Map<string, number>()
 
 export function getLastEmbeddingError(): string | null {
   return lastEmbeddingError
+}
+
+export function resetEmbeddingOptimizeAccountingForTests(): void {
+  incrementalOptimizeCounts.clear()
+  embeddingFailureVersion = 0
+  lastEmbeddingError = null
 }
 
 // ── fetchEmbedding with auto-halve retry ────────────────────────────────
@@ -83,158 +93,75 @@ export async function fetchEmbedding(
   maxRetries = 3,
 ): Promise<number[] | null> {
   if (!cfg.endpoint) return null
-
-  const isGoogleNative = isGoogleEmbeddingConfig(cfg)
-  const endpoint = isGoogleNative ? googleEmbeddingEndpoint(cfg) : cfg.endpoint
-  const headers: Record<string, string> = { "Content-Type": "application/json" }
-  if (cfg.apiKey) {
-    if (isGoogleNative) {
-      headers["x-goog-api-key"] = cfg.apiKey
-    } else {
-      headers.Authorization = `Bearer ${cfg.apiKey}`
-    }
-  }
-
-  let current = text
-  let attempts = 0
-  while (attempts <= maxRetries) {
-    attempts++
-    try {
-      const httpFetch = await getHttpFetch()
-      const resp = await httpFetch(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(
-          isGoogleNative
-            ? googleEmbeddingBody(cfg.model, current, cfg.outputDimensionality)
-            : { model: cfg.model, input: current },
-        ),
-      })
-
-      if (resp.ok) {
-        const data = await resp.json()
-        const embedding = isGoogleNative
-          ? data?.embedding?.values ?? null
-          : data?.data?.[0]?.embedding ?? null
-        if (isNonEmptyNumberArray(embedding)) {
-          lastEmbeddingError = null
-          return embedding
-        }
-        const expectedShape = isGoogleNative ? "embedding.values" : "data[0].embedding"
-        lastEmbeddingError = `Embedding response missing ${expectedShape} (got ${JSON.stringify(data).slice(0, 200)})`
-        console.warn(`[Embedding] ${lastEmbeddingError}`)
-        return null
-      }
-
-      // Non-OK: try to read the body for an oversize hint.
-      let bodyText = ""
-      try {
-        bodyText = await resp.text()
-      } catch {
-        // ignore — some servers return empty bodies on error
-      }
-
-      if (looksLikeOversizeError(resp.status, bodyText)) {
-        // Can we still halve-and-retry? Need room on both axes:
-        // text not yet at the 64-char floor, and retry budget left.
-        if (current.length > 64 && attempts <= maxRetries) {
-          const prev = current.length
-          current = current.slice(0, Math.floor(current.length / 2))
-          console.warn(
-            `[Embedding] auto-halving after HTTP ${resp.status} at ${prev} chars → retrying at ${current.length} chars (attempt ${attempts}/${maxRetries + 1})`,
-          )
-          continue
-        }
-        // Out of retries on a SERVER-oversize error — give the user a
-        // message that names the smallest size that still failed so
-        // they can tune Settings → Embedding accordingly.
-        lastEmbeddingError = `Endpoint rejected input even at ${current.length} chars — server context smaller than expected. Lower Settings → Embedding → Max Chunk Chars (${bodyText.slice(0, 160)}).`
-        console.warn(`[Embedding] ${lastEmbeddingError}`)
-        return null
-      }
-
-      // Non-oversize definitive failure (auth, rate limit, server down, …).
-      lastEmbeddingError = `API ${resp.status} ${resp.statusText}${bodyText ? ` — ${bodyText.slice(0, 200)}` : ""} at ${endpoint}`
-      console.warn(`[Embedding] ${lastEmbeddingError}`)
-      return null
-    } catch (err) {
-      if (isFetchNetworkError(err)) {
-        lastEmbeddingError = `Network error reaching ${endpoint}. Check endpoint URL, API key, and connectivity.`
-      } else {
-        lastEmbeddingError = err instanceof Error ? err.message : String(err)
-      }
-      console.warn(`[Embedding] ${lastEmbeddingError}`)
-      return null
-    }
-  }
-
-  // Exhausted retries (only reachable if every halving round triggered
-  // the retry branch and then the loop condition ended).
-  lastEmbeddingError = `Embedding endpoint rejected every size down to ${current.length} chars — the server's context is smaller than ${current.length * 2}. Lower Settings → Embedding → Max Chunk Chars.`
-  console.warn(`[Embedding] ${lastEmbeddingError}`)
-  return null
-}
-
-function isNonEmptyNumberArray(value: unknown): value is number[] {
-  return Array.isArray(value)
-    && value.length > 0
-    && value.every((item) => typeof item === "number" && Number.isFinite(item))
-}
-
-function isGoogleEmbeddingConfig(cfg: EmbeddingConfig): boolean {
-  const endpoint = cfg.endpoint.toLowerCase()
-  return endpoint.includes("generativelanguage.googleapis.com")
-    || /:embedcontent(\?|$)/i.test(endpoint)
-}
-
-function googleEmbeddingEndpoint(cfg: EmbeddingConfig): string {
-  const raw = stripGoogleApiKeyQuery(cfg.endpoint.trim()).replace(/\/+$/, "")
-  if (/:batchEmbedContents(\?|$)/i.test(raw)) {
-    return raw.replace(/:batchEmbedContents/i, ":embedContent")
-  }
-  if (/:embedContent(\?|$)/i.test(raw)) return raw
-
-  const modelPath = googleModelPath(cfg.model)
-  if (/\/models\/[^/?]+$/i.test(raw)) {
-    return `${raw}:embedContent`
-  }
-  return `${raw}/models/${encodeURIComponent(modelPath.replace(/^models\//, ""))}:embedContent`
-}
-
-function stripGoogleApiKeyQuery(endpoint: string): string {
-  if (!endpoint.includes("?")) return endpoint
+  const failureVersionAtStart = embeddingFailureVersion
   try {
-    const url = new URL(endpoint)
-    url.searchParams.delete("key")
-    return url.toString()
-  } catch {
-    return endpoint.replace(/([?&])key=[^&]*&?/i, (_, prefix: string) => prefix === "?" ? "?" : "&")
-      .replace(/[?&]$/, "")
-      .replace("?&", "?")
+    const embedding = await invoke<number[]>("embedding_fetch", {
+      text,
+      cfg,
+      maxRetries,
+    })
+    // Do not let a concurrent success erase an error that completed after
+    // this request began. A later sequential success still clears it.
+    if (embeddingFailureVersion === failureVersionAtStart) lastEmbeddingError = null
+    return embedding
+  } catch (err) {
+    embeddingFailureVersion++
+    lastEmbeddingError = err instanceof Error ? err.message : String(err)
+    console.warn(`[Embedding] ${lastEmbeddingError}`)
+    return null
   }
 }
 
-function googleModelPath(model: string): string {
-  const trimmed = model.trim()
-  if (trimmed.startsWith("models/")) return trimmed
-  return `models/${trimmed}`
+async function fetchBatchEmbeddings(
+  texts: string[],
+  cfg: EmbeddingConfig,
+): Promise<number[][] | null> {
+  if (texts.length === 0) return []
+  const failureVersionAtStart = embeddingFailureVersion
+  try {
+    const embeddings = await invoke<number[][]>("embedding_fetch_batch", { texts, cfg })
+    if (embeddings.length !== texts.length) {
+      throw new Error(`Embedding batch returned ${embeddings.length} vectors for ${texts.length} inputs`)
+    }
+    if (embeddingFailureVersion === failureVersionAtStart) lastEmbeddingError = null
+    return embeddings
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.warn(`[Embedding] Batch request failed; retrying inputs individually: ${message}`)
+    return null
+  }
 }
 
-function googleEmbeddingBody(
-  model: string,
-  text: string,
-  outputDimensionality?: number,
-): Record<string, unknown> {
-  const body: Record<string, unknown> = {
-    model: googleModelPath(model),
-    content: {
-      parts: [{ text }],
-    },
+function supportsOpenAiCompatibleBatch(cfg: EmbeddingConfig): boolean {
+  const endpoint = cfg.endpoint.toLowerCase()
+  const model = cfg.model.toLowerCase()
+  return !endpoint.includes("generativelanguage.googleapis.com")
+    && !endpoint.includes(":embedcontent")
+    && !model.includes("doubao-embedding-vision")
+}
+
+type AsyncLimiter = <T>(task: () => Promise<T>) => Promise<T>
+
+function createAsyncLimiter(rawLimit: number | undefined): AsyncLimiter {
+  const limit = Math.max(1, Math.min(32, Math.floor(rawLimit ?? 1)))
+  let active = 0
+  const waiters: Array<() => void> = []
+  return async <T>(task: () => Promise<T>): Promise<T> => {
+    if (active < limit) {
+      active++
+    } else {
+      // A queued resolver owns the permit transferred by the completing task;
+      // it must not increment active again when it resumes.
+      await new Promise<void>((resolve) => waiters.push(resolve))
+    }
+    try {
+      return await task()
+    } finally {
+      const next = waiters.shift()
+      if (next) next()
+      else active--
+    }
   }
-  if (typeof outputDimensionality === "number" && Number.isFinite(outputDimensionality) && outputDimensionality > 0) {
-    body.output_dimensionality = Math.floor(outputDimensionality)
-  }
-  return body
 }
 
 // ── LanceDB v2 operations (via Rust Tauri commands) ──────────────────────
@@ -297,6 +224,18 @@ async function vectorCountChunks(projectPath: string): Promise<number> {
   })
 }
 
+async function vectorClearChunks(projectPath: string): Promise<void> {
+  await invoke("vector_clear_chunks", {
+    projectPath: normalizePath(projectPath),
+  })
+}
+
+async function vectorOptimizeChunks(projectPath: string): Promise<void> {
+  await invoke("vector_optimize_chunks", {
+    projectPath: normalizePath(projectPath),
+  })
+}
+
 export async function legacyVectorRowCount(projectPath: string): Promise<number> {
   try {
     return await invoke("vector_legacy_row_count", {
@@ -311,6 +250,41 @@ export async function dropLegacyVectorTable(projectPath: string): Promise<void> 
   await invoke("vector_drop_legacy", {
     projectPath: normalizePath(projectPath),
   })
+}
+
+export async function clearChunkVectorTable(projectPath: string): Promise<void> {
+  await vectorClearChunks(projectPath)
+}
+
+async function optimizeChunkVectorTableBestEffort(projectPath: string): Promise<void> {
+  try {
+    await vectorOptimizeChunks(projectPath)
+  } catch (err) {
+    console.warn(
+      `[Embedding] LanceDB chunk optimization failed: ${err instanceof Error ? err.message : err}`,
+    )
+  }
+}
+
+async function dropLegacyVectorTableBestEffort(projectPath: string): Promise<void> {
+  try {
+    await dropLegacyVectorTable(projectPath)
+  } catch (err) {
+    console.warn(
+      `[Embedding] Legacy vector table cleanup failed: ${err instanceof Error ? err.message : err}`,
+    )
+  }
+}
+
+async function noteIncrementalVectorWrite(projectPath: string): Promise<void> {
+  const pp = normalizePath(projectPath)
+  const count = (incrementalOptimizeCounts.get(pp) ?? 0) + 1
+  if (count < INCREMENTAL_OPTIMIZE_PAGE_THRESHOLD) {
+    incrementalOptimizeCounts.set(pp, count)
+    return
+  }
+  incrementalOptimizeCounts.set(pp, 0)
+  await optimizeChunkVectorTableBestEffort(pp)
 }
 
 // ── Chunk enrichment ─────────────────────────────────────────────────────
@@ -333,6 +307,84 @@ function enrichChunkForEmbedding(
   return parts.join("\n\n")
 }
 
+interface PreparedPageEmbedding {
+  pageId: string
+  rows: ChunkUpsertInput[]
+  chunkCount: number
+  failedChunks: number
+}
+
+type PageEmbeddingPreparation =
+  | { status: "ready"; page: PreparedPageEmbedding }
+  | { status: "empty" }
+  | { status: "failed"; reason: string }
+
+/** @internal Exported for unit tests only. */
+export function extractEmbeddingTitle(content: string, fallbackId: string): string {
+  const title = parseFrontmatter(content).frontmatter?.title
+  return typeof title === "string" && title.trim() ? title.trim() : fallbackId
+}
+
+async function preparePageEmbeddingRows(
+  pageId: string,
+  title: string,
+  content: string,
+  cfg: EmbeddingConfig,
+  schedule: AsyncLimiter = createAsyncLimiter(cfg.concurrency),
+): Promise<PageEmbeddingPreparation> {
+  if (!cfg.enabled || !cfg.model) return { status: "empty" }
+
+  const chunks = chunkMarkdown(content, {
+    targetChars: cfg.maxChunkChars ?? 1000,
+    overlapChars: cfg.overlapChunkChars ?? 200,
+  })
+  if (chunks.length === 0) return { status: "empty" }
+
+  const batchSize = Math.max(1, Math.min(64, Math.floor(cfg.batchSize ?? 1)))
+  const tasks: Array<Promise<ChunkUpsertInput[]>> = []
+  for (let offset = 0; offset < chunks.length; offset += batchSize) {
+    const batch = chunks.slice(offset, offset + batchSize)
+    const texts = batch.map((chunk) => enrichChunkForEmbedding(title, chunk))
+    tasks.push((async () => {
+      const vectors = batch.length > 1 && supportsOpenAiCompatibleBatch(cfg)
+        ? await schedule(() => fetchBatchEmbeddings(texts, cfg))
+        : null
+      const resolved = vectors ?? await Promise.all(
+        texts.map((text) => schedule(() => fetchEmbedding(text, cfg))),
+      )
+      return resolved.flatMap((embedding, index) => {
+        if (!embedding) return []
+        const chunk = batch[index]
+        return [{
+          chunkIndex: chunk.index,
+          chunkText: chunk.text,
+          headingPath: chunk.headingPath,
+          embedding,
+        }]
+      })
+    })())
+  }
+  const rows = (await Promise.all(tasks)).flat()
+  rows.sort((a, b) => a.chunkIndex - b.chunkIndex)
+  const failedChunks = chunks.length - rows.length
+
+  if (rows.length === 0) {
+    return {
+      status: "failed",
+      reason: getLastEmbeddingError() || "all chunks failed to embed",
+    }
+  }
+  return {
+    status: "ready",
+    page: {
+      pageId,
+      rows,
+      chunkCount: chunks.length,
+      failedChunks,
+    },
+  }
+}
+
 // ── Public API: embedPage / embedAllPages / searchByEmbedding ────────────
 
 /**
@@ -348,45 +400,99 @@ export async function embedPage(
   title: string,
   content: string,
   cfg: EmbeddingConfig,
-): Promise<void> {
-  if (!cfg.enabled || !cfg.model) return
-
+  options?: { deferOptimization?: boolean },
+): Promise<boolean> {
   const t0 = performance.now()
-  const chunks = chunkMarkdown(content, {
-    targetChars: cfg.maxChunkChars ?? 1000,
-    overlapChars: cfg.overlapChunkChars ?? 200,
-  })
-  if (chunks.length === 0) return
+  const prepared = await preparePageEmbeddingRows(pageId, title, content, cfg)
 
-  const rows: ChunkUpsertInput[] = []
-  let failedChunks = 0
-  for (const chunk of chunks) {
-    const embedText = enrichChunkForEmbedding(title, chunk)
-    const vec = await fetchEmbedding(embedText, cfg)
-    if (vec) {
-      rows.push({
-        chunkIndex: chunk.index,
-        chunkText: chunk.text,
-        headingPath: chunk.headingPath,
-        embedding: vec,
-      })
-    } else {
-      failedChunks++
+  if (prepared.status !== "ready") {
+    if (prepared.status === "failed") {
+      console.log(
+        `[Embedding] Indexed nothing for "${pageId}" — no chunks could be embedded. See getLastEmbeddingError().`,
+      )
     }
+    return false
   }
 
-  if (rows.length === 0) {
-    console.log(
-      `[Embedding] Indexed nothing for "${pageId}" — all ${chunks.length} chunks failed. See getLastEmbeddingError().`,
-    )
-    return
+  await vectorUpsertChunks(projectPath, pageId, prepared.page.rows)
+  if (!options?.deferOptimization) {
+    await noteIncrementalVectorWrite(projectPath)
   }
-
-  await vectorUpsertChunks(projectPath, pageId, rows)
   const elapsed = Math.round(performance.now() - t0)
   console.log(
-    `[Embedding] Indexed "${pageId}": ${rows.length}/${chunks.length} chunks (${failedChunks} skipped) in ${elapsed}ms`,
+    `[Embedding] Indexed "${pageId}": ${prepared.page.rows.length}/${prepared.page.chunkCount} chunks (${prepared.page.failedChunks} skipped) in ${elapsed}ms`,
   )
+  return true
+}
+
+export type EmbeddingReindexState =
+  | { kind: "idle" }
+  | { kind: "running"; projectPath: string; done: number; total: number }
+  | { kind: "done"; projectPath: string; count: number }
+  | { kind: "error"; projectPath: string; message: string }
+
+let embeddingReindexState: EmbeddingReindexState = { kind: "idle" }
+const embeddingReindexListeners = new Set<() => void>()
+
+export function getEmbeddingReindexState(): EmbeddingReindexState {
+  return embeddingReindexState
+}
+
+export function subscribeEmbeddingReindexState(listener: () => void): () => void {
+  embeddingReindexListeners.add(listener)
+  return () => embeddingReindexListeners.delete(listener)
+}
+
+function setEmbeddingReindexState(state: EmbeddingReindexState): void {
+  embeddingReindexState = state
+  for (const listener of embeddingReindexListeners) listener()
+}
+
+function throwEmbeddingReindexError(projectPath: string, message: string): never {
+  setEmbeddingReindexState({ kind: "error", projectPath, message })
+  throw new Error(message)
+}
+
+async function parallelForEach<T>(
+  items: T[],
+  rawLimit: number | undefined,
+  visit: (item: T) => Promise<void>,
+): Promise<void> {
+  const workerCount = Math.min(
+    items.length,
+    Math.max(1, Math.min(32, Math.floor(rawLimit ?? 1))),
+  )
+  let next = 0
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (next < items.length) {
+      const index = next++
+      await visit(items[index])
+    }
+  }))
+}
+
+async function preparePageEmbeddingRowsWithRetry(
+  pageId: string,
+  title: string,
+  content: string,
+  cfg: EmbeddingConfig,
+  attempts = 3,
+  schedule: AsyncLimiter = createAsyncLimiter(cfg.concurrency),
+): Promise<PageEmbeddingPreparation> {
+  let best = await preparePageEmbeddingRows(pageId, title, content, cfg, schedule)
+  for (let attempt = 1; attempt < attempts; attempt += 1) {
+    if (best.status === "empty") return best
+    if (best.status === "ready" && best.page.failedChunks === 0) return best
+    await new Promise((resolve) => setTimeout(resolve, attempt * 250))
+    const candidate = await preparePageEmbeddingRows(pageId, title, content, cfg, schedule)
+    if (
+      candidate.status === "ready"
+      && (best.status !== "ready" || candidate.page.failedChunks < best.page.failedChunks)
+    ) {
+      best = candidate
+    }
+  }
+  return best
 }
 
 /**
@@ -399,15 +505,24 @@ export async function embedAllPages(
   projectPath: string,
   cfg: EmbeddingConfig,
   onProgress?: (done: number, total: number) => void,
+  options?: { clearExisting?: boolean },
 ): Promise<number> {
   if (!cfg.enabled || !cfg.model) return 0
+  lastEmbeddingError = null
 
   const pp = normalizePath(projectPath)
+  setEmbeddingReindexState({ kind: "running", projectPath: pp, done: 0, total: 0 })
 
   let tree: FileNode[]
   try {
     tree = await listDirectory(`${pp}/wiki`)
   } catch {
+    if (options?.clearExisting) {
+      const message = "Could not read wiki tree; existing index was left unchanged."
+      setEmbeddingReindexState({ kind: "error", projectPath: pp, message })
+      throw new Error(message)
+    }
+    setEmbeddingReindexState({ kind: "done", projectPath: pp, count: 0 })
     return 0
   }
 
@@ -425,22 +540,150 @@ export async function embedAllPages(
     }
   }
   walk(tree)
+  const scheduleEmbedding = createAsyncLimiter(cfg.concurrency)
+  // LanceDB page replacement is intentionally serialized. The configured
+  // concurrency applies to outbound embedding HTTP, not database writers.
+  const scheduleVectorWrite = createAsyncLimiter(1)
+
+  if (options?.clearExisting) {
+    if (mdFiles.length === 0) {
+      const existingChunks = await vectorCountChunks(pp).catch(() => 0)
+      if (existingChunks > 0) {
+        throwEmbeddingReindexError(
+          pp,
+          `Wiki tree returned no content pages, but ${existingChunks} chunks are currently indexed. Existing index was left unchanged.`,
+        )
+      }
+      await clearChunkVectorTable(pp)
+      await dropLegacyVectorTableBestEffort(pp)
+      setEmbeddingReindexState({ kind: "done", projectPath: pp, count: 0 })
+      return 0
+    }
+
+    const preparedPages: PreparedPageEmbedding[] = []
+    const failures: string[] = []
+    let attempted = 0
+    await parallelForEach(mdFiles, cfg.concurrency, async (file) => {
+      try {
+        const content = await readFile(file.path)
+        const title = extractEmbeddingTitle(content, file.id)
+        const prepared = await preparePageEmbeddingRowsWithRetry(
+          file.id,
+          title,
+          content,
+          cfg,
+          3,
+          scheduleEmbedding,
+        )
+        if (prepared.status === "ready") {
+          if (prepared.page.failedChunks > 0) {
+            const reason = getLastEmbeddingError()
+            failures.push(
+              `${file.id}: ${prepared.page.failedChunks} of ${prepared.page.chunkCount} chunks failed to embed${reason ? ` (${reason})` : ""}`,
+            )
+          } else {
+            preparedPages.push(prepared.page)
+          }
+        } else if (prepared.status === "failed") {
+          failures.push(`${file.id}: ${prepared.reason}`)
+        }
+      } catch (err) {
+        failures.push(`${file.id}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+      attempted++
+      setEmbeddingReindexState({
+        kind: "running",
+        projectPath: pp,
+        done: attempted,
+        total: mdFiles.length,
+      })
+      if (onProgress) onProgress(attempted, mdFiles.length)
+    })
+
+    if (failures.length > 0) {
+      let updated = 0
+      for (const page of preparedPages) {
+        try {
+          await vectorUpsertChunks(pp, page.pageId, page.rows)
+          updated++
+        } catch (err) {
+          failures.push(
+            `${page.pageId}: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        }
+      }
+      if (updated > 0) await optimizeChunkVectorTableBestEffort(pp)
+      const error = `${failures.length} of ${mdFiles.length} pages could not be embedded (${failures[0]}). ${updated} successful page(s) were updated; failed pages kept their previous vectors and can be retried.`
+      setEmbeddingReindexState({ kind: "error", projectPath: pp, message: error })
+      throw new Error(error)
+    }
+
+    if (preparedPages.length === 0) {
+      const existingChunks = await vectorCountChunks(pp).catch(() => 0)
+      if (existingChunks > 0) {
+        throwEmbeddingReindexError(
+          pp,
+          `Wiki tree has only empty content pages, but ${existingChunks} chunks are currently indexed. Existing index was left unchanged.`,
+        )
+      }
+    }
+
+    await clearChunkVectorTable(pp)
+
+    let written = 0
+    for (const page of preparedPages) {
+      try {
+        await vectorUpsertChunks(pp, page.pageId, page.rows)
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err)
+        throwEmbeddingReindexError(
+          pp,
+          `Rebuild write failed after clearing existing chunks (${page.pageId}: ${reason}). The rebuilt index may be incomplete; run re-index again after fixing the error.`,
+        )
+      }
+      written++
+      console.log(
+        `[Embedding] Rebuilt "${page.pageId}": ${page.rows.length}/${page.chunkCount} chunks (${page.failedChunks} skipped)`,
+      )
+    }
+
+    if (written > 0) {
+      await optimizeChunkVectorTableBestEffort(pp)
+    }
+    // Forced rebuild succeeded, so the legacy v1 per-page table is obsolete
+    // even when every readable content page was empty and no v2 rows were
+    // written. Keep this outside the `written > 0` optimization guard.
+    await dropLegacyVectorTableBestEffort(pp)
+
+    setEmbeddingReindexState({ kind: "done", projectPath: pp, count: written })
+    return written
+  }
 
   let done = 0
-  for (const file of mdFiles) {
+  let indexed = 0
+  await parallelForEach(mdFiles, cfg.concurrency, async (file) => {
     try {
       const content = await readFile(file.path)
-      const titleMatch = content.match(/^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m)
-      const title = titleMatch ? titleMatch[1].trim() : file.id
-      await embedPage(pp, file.id, title, content, cfg)
+      const title = extractEmbeddingTitle(content, file.id)
+      const prepared = await preparePageEmbeddingRows(file.id, title, content, cfg, scheduleEmbedding)
+      if (prepared.status === "ready") {
+        await scheduleVectorWrite(() => vectorUpsertChunks(pp, file.id, prepared.page.rows))
+        indexed++
+      }
     } catch {
       // skip — individual file failure doesn't halt the batch
     }
     done++
+    setEmbeddingReindexState({ kind: "running", projectPath: pp, done, total: mdFiles.length })
     if (onProgress) onProgress(done, mdFiles.length)
+  })
+
+  if (indexed > 0) {
+    await optimizeChunkVectorTableBestEffort(pp)
   }
 
-  return done
+  setEmbeddingReindexState({ kind: "done", projectPath: pp, count: indexed })
+  return indexed
 }
 
 /**

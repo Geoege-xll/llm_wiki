@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
 import "katex/dist/katex.min.css"
-import { transformWikilinks } from "@/lib/wikilink-transform"
+import { transformImageEmbeds, transformWikilinks } from "@/lib/wikilink-transform"
 import { resolveRelatedSlug } from "@/lib/wiki-page-resolver"
 import { resolveMarkdownImageSrc } from "@/lib/markdown-image-resolver"
 import { normalizePath } from "@/lib/path-utils"
@@ -15,6 +15,18 @@ import { MermaidDiagram, unwrapMermaidPre } from "@/components/mermaid-diagram"
 
 interface WikiReaderProps {
   body: string
+  /** Original, untransformed Markdown body used for DOM-to-source mapping. */
+  sourceBody?: string
+  /** Character offset where sourceBody begins in the full Markdown file. */
+  sourceOffset?: number
+  /**
+   * Absolute path of the markdown file being rendered. Used to
+   * resolve relative image references against the file's own
+   * directory (Obsidian-style), so e.g. `../assets/x.png` works.
+   * Optional — when omitted, image paths fall back to wiki-root
+   * resolution.
+   */
+  filePath?: string
 }
 
 /**
@@ -26,20 +38,54 @@ interface WikiReaderProps {
  * never serialize back to disk, transforming for display is safe.
  *
  * Wikilink anchor clicks are intercepted: `#slug` is resolved
- * against the project's wiki tree and routed to setSelectedFile,
+ * against the project's wiki tree and routed to the wiki preview,
  * giving the user single-click navigation between pages.
  */
-export function WikiReader({ body }: WikiReaderProps) {
+export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: WikiReaderProps) {
   const project = useWikiStore((s) => s.project)
-  const fileTree = useWikiStore((s) => s.fileTree)
-  const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
+  const projectPathIndex = useWikiStore((s) => s.projectPathIndex)
+  const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
 
-  const transformed = useMemo(() => transformWikilinks(body), [body])
+  // Image embeds (`![[…]]`) must be rewritten BEFORE the generic
+  // wikilink pass, otherwise the embed target gets mangled into a
+  // `#fragment` link.
+  const transformed = useMemo(
+    () => transformWikilinks(transformImageEmbeds(body)),
+    [body],
+  )
+  const sourceLineStarts = useMemo(() => {
+    if (sourceBody === undefined) return null
+    const starts = [0]
+    for (let index = 0; index < sourceBody.length; index += 1) {
+      if (sourceBody.charCodeAt(index) === 10) starts.push(index + 1)
+    }
+    return starts
+  }, [sourceBody])
+
+  const sourceAttrs = (node: unknown): Record<string, number> => {
+    if (!sourceLineStarts) return {}
+    const position = (node as { position?: { start?: { line?: number }; end?: { line?: number } } } | undefined)?.position
+    const startLine = position?.start?.line
+    const endLine = position?.end?.line
+    if (!startLine || !endLine) return {}
+    const start = sourceLineStarts[startLine - 1]
+    const end = sourceLineStarts[endLine] ?? sourceBody?.length
+    if (start === undefined || end === undefined) return {}
+    return { "data-source-start": sourceOffset + start, "data-source-end": sourceOffset + end }
+  }
   const renderLanguage = detectLanguage(body)
   const direction = getTextDirection(renderLanguage)
   const htmlLang = getHtmlLang(renderLanguage)
   const projectPath = project ? normalizePath(project.path) : null
   const wikiRoot = projectPath ? `${projectPath}/wiki` : null
+  // Directory of the file being rendered (project-absolute), so
+  // relative image srcs resolve against it like Obsidian does.
+  const currentFileDir = useMemo(() => {
+    if (!filePath) return null
+    const norm = normalizePath(filePath)
+    const dir = norm.slice(0, norm.lastIndexOf("/"))
+    return dir || null
+  }, [filePath])
 
   function handleAnchorClick(e: React.MouseEvent<HTMLAnchorElement>, href: string) {
     if (!href.startsWith("#")) return
@@ -52,8 +98,8 @@ export function WikiReader({ body }: WikiReaderProps) {
         return href.slice(1)
       }
     })()
-    const path = resolveRelatedSlug(fileTree, slug, wikiRoot)
-    if (path) setSelectedFile(path)
+    const path = resolveRelatedSlug(projectPathIndex, slug, wikiRoot)
+    if (path) openPathInPreview(path)
   }
 
   return (
@@ -67,6 +113,9 @@ export function WikiReader({ body }: WikiReaderProps) {
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
         components={{
+          p: ({ node, children, ...props }) => <p {...sourceAttrs(node)} {...props}>{children}</p>,
+          li: ({ node, children, ...props }) => <li {...sourceAttrs(node)} {...props}>{children}</li>,
+          blockquote: ({ node, children, ...props }) => <blockquote {...sourceAttrs(node)} {...props}>{children}</blockquote>,
           a: ({ href, children, ...props }) => {
             const h = typeof href === "string" ? href : ""
             const isWikilink = h.startsWith("#")
@@ -85,11 +134,38 @@ export function WikiReader({ body }: WikiReaderProps) {
               </a>
             )
           },
+          h1: ({ node, children, ...props }) => (
+            <h1
+              {...sourceAttrs(node)}
+              className="mb-4 mt-0 border-b border-border/60 pb-3 text-3xl font-semibold leading-tight tracking-normal text-foreground"
+              {...props}
+            >
+              {children}
+            </h1>
+          ),
+          h2: ({ node, children, ...props }) => (
+            <h2
+              {...sourceAttrs(node)}
+              className="mb-3 mt-8 border-b border-border/40 pb-2 text-2xl font-semibold leading-tight tracking-normal text-foreground"
+              {...props}
+            >
+              {children}
+            </h2>
+          ),
+          h3: ({ node, children, ...props }) => (
+            <h3
+              {...sourceAttrs(node)}
+              className="mb-2 mt-6 text-xl font-semibold leading-snug tracking-normal text-foreground"
+              {...props}
+            >
+              {children}
+            </h3>
+          ),
           img: ({ src, alt, ...props }) => (
             <img
               src={
                 typeof src === "string"
-                  ? resolveMarkdownImageSrc(src, projectPath)
+                  ? resolveMarkdownImageSrc(src, projectPath, currentFileDir)
                   : undefined
               }
               data-mdsrc={typeof src === "string" ? src : undefined}
@@ -111,16 +187,17 @@ export function WikiReader({ body }: WikiReaderProps) {
               {children}
             </thead>
           ),
-          th: ({ children, ...props }) => (
+          th: ({ node, children, ...props }) => (
             <th
+              {...sourceAttrs(node)}
               className="border border-border/80 bg-muted px-3 py-1.5 text-start font-semibold"
               {...props}
             >
               {children}
             </th>
           ),
-          td: ({ children, ...props }) => (
-            <td className="border border-border/60 px-3 py-1.5" {...props}>
+          td: ({ node, children, ...props }) => (
+            <td {...sourceAttrs(node)} className="border border-border/60 px-3 py-1.5" {...props}>
               {children}
             </td>
           ),

@@ -4,7 +4,7 @@ import { getProviderConfig, type RequestOverrides } from "./llm-providers"
 import { getHttpFetch, isFetchNetworkError } from "./tauri-fetch"
 import { countReasoningCharsInLine, extractReasoningTextFromLine } from "./reasoning-detector"
 
-export type { ChatMessage, RequestOverrides } from "./llm-providers"
+export type { ChatMessage, ContentBlock, RequestOverrides } from "./llm-providers"
 export { isFetchNetworkError } from "./tauri-fetch"
 
 export interface StreamCallbacks {
@@ -12,6 +12,21 @@ export interface StreamCallbacks {
   onReasoningToken?: (token: string) => void
   onDone: () => void
   onError: (error: Error) => void
+}
+
+function bufferedStreamCallbacks(callbacks: StreamCallbacks): StreamCallbacks {
+  let content = ""
+  let reasoning = ""
+  return {
+    onToken: (token) => { content += token },
+    onReasoningToken: (token) => { reasoning += token },
+    onDone: () => {
+      if (reasoning) callbacks.onReasoningToken?.(reasoning)
+      if (content) callbacks.onToken(content)
+      callbacks.onDone()
+    },
+    onError: callbacks.onError,
+  }
 }
 
 // Lazy import keeps the Tauri event/invoke bindings out of bundles that
@@ -47,6 +62,16 @@ function parseLines(chunk: Uint8Array, buffer: string): [string[], string] {
   return [lines, remaining]
 }
 
+function isRequestCancelledError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /^request cancel(?:l)?ed$/i.test(message.trim())
+}
+
+export function isReasoningOnlyResponseError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /^Model produced [\d,]+ characters of reasoning \/ chain-of-thought, but no actual response content\./.test(message)
+}
+
 export async function streamChat(
   config: LlmConfig,
   messages: import("./llm-providers").ChatMessage[],
@@ -68,11 +93,23 @@ export async function streamChat(
   // HTTP. Dispatch before getProviderConfig — that function throws for
   // this provider because it has no URL/headers.
   if (config.provider === "claude-code") {
-    return streamViaClaudeCodeCli(config, messages, callbacks, signal, requestOverrides)
+    return streamViaClaudeCodeCli(
+      config,
+      messages,
+      config.streamingEnabled === false ? bufferedStreamCallbacks(callbacks) : callbacks,
+      signal,
+      requestOverrides,
+    )
   }
 
   if (config.provider === "codex-cli") {
-    return streamViaCodexCli(config, messages, callbacks, signal, requestOverrides)
+    return streamViaCodexCli(
+      config,
+      messages,
+      config.streamingEnabled === false ? bufferedStreamCallbacks(callbacks) : callbacks,
+      signal,
+      requestOverrides,
+    )
   }
 
   const providerConfig = getProviderConfig(config)
@@ -83,7 +120,8 @@ export async function streamChat(
   // almost always a fast network failure (DNS, TLS, 404, refused) that
   // WebKit surfaces as a generic "Load failed". We track whether the
   // backstop actually fired so we can tell the two apart in the error.
-  const timeoutMs = 30 * 60 * 1000 // 30 min — generous backstop for huge-context reasoning models
+  const timeoutMinutes = Math.max(1, Math.min(1440, config.requestTimeoutMinutes ?? 30))
+  const timeoutMs = timeoutMinutes * 60 * 1000
   let combinedSignal = signal
   let timeoutController: AbortController | undefined
   let timeoutFired = false
@@ -119,7 +157,7 @@ export async function streamChat(
       onDone()
       return
     }
-    if (err instanceof Error && err.name === "AbortError") {
+    if ((err instanceof Error && err.name === "AbortError") || isRequestCancelledError(err)) {
       // Backstop timeout aborted the request (we tracked this via
       // timeoutFired); treat it as a real timeout rather than a cancel.
       if (timeoutFired) {
@@ -169,6 +207,38 @@ export async function streamChat(
       return
     }
     onError(new Error(errorDetail))
+    return
+  }
+
+  if (!providerConfig.streaming) {
+    try {
+      const payload: unknown = await response.json()
+      const content = providerConfig.parseResponse(payload)
+      if (!content) {
+        onError(new Error("Model returned an empty non-streaming response"))
+        return
+      }
+      onToken(content)
+      onDone()
+    } catch (err) {
+      if (timeoutFired) {
+        onError(new Error(`Request timed out after ${Math.round(timeoutMs / 60000)} min. Try a faster model or a smaller context.`))
+        return
+      }
+      if (
+        signal?.aborted ||
+        (err instanceof Error && err.name === "AbortError") ||
+        isRequestCancelledError(err)
+      ) {
+        onDone()
+        return
+      }
+      if (isFetchNetworkError(err)) {
+        onError(new Error("Connection lost while reading the complete response. Try again."))
+        return
+      }
+      onError(err instanceof Error ? err : new Error(String(err)))
+    }
     return
   }
 
@@ -256,7 +326,23 @@ export async function streamChat(
 
     onDone()
   } catch (err) {
-    if (err instanceof Error && (err.name === "AbortError" || (signal?.aborted))) {
+    // The abort can reach us two ways: a real AbortError, or — when the
+    // Tauri HTTP plugin tears down the body stream — a bare *string*
+    // "Request cancelled" passed to controller.error(). The latter is not
+    // an Error, so the old `err instanceof Error` guard let it fall through
+    // to the generic branch and surface verbatim. Recognize both shapes.
+    const isAbort =
+      signal?.aborted ||
+      timeoutFired ||
+      (err instanceof Error && err.name === "AbortError") ||
+      isRequestCancelledError(err)
+    if (isAbort) {
+      // Mirror the pre-fetch catch: distinguish our long-horizon backstop
+      // (an actionable timeout) from a user-initiated cancel (silent).
+      if (timeoutFired) {
+        onError(new Error(`Request timed out after ${Math.round(timeoutMs / 60000)} min. Try a faster model or a smaller context.`))
+        return
+      }
       onDone()
       return
     }

@@ -1,5 +1,5 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event"
-import { readFile, listDirectory } from "@/commands/fs"
+import { readFile } from "@/commands/fs"
 import {
   rescanProjectFiles,
   startProjectFileWatcher,
@@ -17,8 +17,10 @@ import {
   deleteSourceFiles,
   enqueueSourceIngest,
   isIngestableSourcePath,
+  migrateSourcePath,
 } from "@/lib/source-lifecycle"
 import { isPathAllowedBySourceWatch, normalizeSourceWatchConfig } from "@/lib/source-watch-config"
+import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 
 let unlistenQueue: UnlistenFn | null = null
 let unlistenChanged: UnlistenFn | null = null
@@ -176,22 +178,65 @@ async function processFileChangeBatch(
   if (handledChangeTaskKeys.size > 4096) {
     handledChangeTaskKeys = new Set([...handledChangeTaskKeys].slice(-2048))
   }
-  await cleanupDeletedFiles(project, tasks)
-  await enqueueRawSourceChanges(project, tasks)
+  const movedTaskIds = await migrateUnchangedSourceMoves(project, tasks)
+  const remainingTasks = tasks.filter((task) => !movedTaskIds.has(task.id))
+  await cleanupDeletedFiles(project, remainingTasks)
+  await enqueueRawSourceChanges(project, remainingTasks)
   await refreshAfterFileChanges(project, paths)
+}
+
+async function migrateUnchangedSourceMoves(
+  project: WikiProject,
+  tasks: FileChangeTask[],
+): Promise<Set<string>> {
+  const moved = new Set<string>()
+  const createdByHash = new Map<string, FileChangeTask[]>()
+  const deletedByHash = new Map<string, FileChangeTask[]>()
+  for (const task of tasks) {
+    if (!isRawSourcePathForCascade(task.path)) continue
+    if (task.kind === "created" && task.hashAfter && (task.size ?? 0) >= 32) {
+      const matches = createdByHash.get(task.hashAfter) ?? []
+      matches.push(task)
+      createdByHash.set(task.hashAfter, matches)
+    } else if (task.kind === "deleted" && task.hashBefore && (task.size ?? 0) >= 32) {
+      const matches = deletedByHash.get(task.hashBefore) ?? []
+      matches.push(task)
+      deletedByHash.set(task.hashBefore, matches)
+    }
+  }
+
+  for (const [hash, deletedMatches] of deletedByHash) {
+    const createdMatches = createdByHash.get(hash)
+    // Content identity only proves a move when both sides are unique.
+    if (deletedMatches.length !== 1 || createdMatches?.length !== 1) continue
+    const deleted = deletedMatches[0]
+    const created = createdMatches[0]
+    try {
+      await migrateSourcePath(project.path, deleted.path, created.path)
+      moved.add(deleted.id)
+      moved.add(created.id)
+    } catch (err) {
+      console.error("[file-sync] failed to migrate unchanged source move:", err)
+      // The hash pair still proves this is a move. Suppress destructive
+      // delete/create fallback after a transactional migration rollback;
+      // surface the failure so the user can retry with a manual rescan.
+      moved.add(deleted.id)
+      moved.add(created.id)
+      useFileSyncStore.getState().setLastError(
+        `Failed to migrate moved source metadata: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
+  return moved
 }
 
 async function refreshAfterFileChanges(project: WikiProject, relativePaths: string[]): Promise<void> {
   const pp = normalizePath(project.path)
   const store = useWikiStore.getState()
-  try {
-    const tree = await listDirectory(pp)
-    useWikiStore.getState().setFileTree(tree)
-  } catch (err) {
-    console.warn("[file-sync] failed to refresh file tree:", err)
-  }
-
-  store.bumpDataVersion()
+  await refreshProjectFileTree(pp, {
+    projectId: project.id,
+    bumpDataVersion: true,
+  })
 
   const selected = store.selectedFile ? normalizePath(store.selectedFile) : null
   if (!selected) return
