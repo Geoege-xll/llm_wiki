@@ -664,29 +664,27 @@ fn extract_docx_with_library(path: &str) -> Result<String, String> {
             docx_rs::DocumentChild::Table(table) => {
                 let mut rows: Vec<Vec<String>> = Vec::new();
                 for row in &table.rows {
-                    if let docx_rs::TableChild::TableRow(tr) = row {
-                        let mut cells: Vec<String> = Vec::new();
-                        for cell in &tr.cells {
-                            if let docx_rs::TableRowChild::TableCell(tc) = cell {
-                                let mut cell_text = String::new();
-                                for child in &tc.children {
-                                    if let docx_rs::TableCellContent::Paragraph(para) = child {
-                                        for pchild in &para.children {
-                                            if let docx_rs::ParagraphChild::Run(run) = pchild {
-                                                for rc in &run.children {
-                                                    if let docx_rs::RunChild::Text(t) = rc {
-                                                        cell_text.push_str(&t.text);
-                                                    }
-                                                }
+                    let docx_rs::TableChild::TableRow(tr) = row;
+                    let mut cells: Vec<String> = Vec::new();
+                    for cell in &tr.cells {
+                        let docx_rs::TableRowChild::TableCell(tc) = cell;
+                        let mut cell_text = String::new();
+                        for child in &tc.children {
+                            if let docx_rs::TableCellContent::Paragraph(para) = child {
+                                for pchild in &para.children {
+                                    if let docx_rs::ParagraphChild::Run(run) = pchild {
+                                        for rc in &run.children {
+                                            if let docx_rs::RunChild::Text(t) = rc {
+                                                cell_text.push_str(&t.text);
                                             }
                                         }
                                     }
                                 }
-                                cells.push(cell_text.trim().replace('|', "\\|"));
                             }
                         }
-                        rows.push(cells);
+                        cells.push(cell_text.trim().replace('|', "\\|"));
                     }
+                    rows.push(cells);
                 }
                 if !rows.is_empty() {
                     let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
@@ -739,6 +737,7 @@ fn decode_xml_entities(text: &str) -> String {
 }
 
 /// Extract DOCX to Markdown preserving headings, paragraphs, lists, tables, bold/italic.
+#[allow(unused_assignments, unused_variables)]
 fn extract_docx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<String, String> {
     let xml = read_zip_file(archive, "word/document.xml")
         .ok_or_else(|| "No document.xml found".to_string())?;

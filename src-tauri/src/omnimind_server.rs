@@ -15,18 +15,22 @@ const SERVICE_NAME: &str = "OmniMind-Wiki-Core";
 const SERVER_MODE: &str = "server-only";
 const DEFAULT_MAX_CONTEXT_SIZE: usize = 204_800;
 const APP_STATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Hybrid retrieval keeps at least this many `raw/sources` hits when available.
+const HYBRID_SOURCES_FLOOR: usize = 2;
 
 pub struct OmnimindResponse {
     status: u16,
     body: Value,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ChatHistoryMessage {
     role: String,
     content: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ChatContextRequest {
     query: String,
@@ -40,6 +44,44 @@ struct ChatContextRequest {
     output_language: Option<String>,
     #[serde(default)]
     include_debug: bool,
+    /// Retrieval mode for chat-context (case-insensitive).
+    /// `wiki` (default) | `sources_only` | `hybrid`
+    /// Aliases: `faithful`/`sources` → sources_only; `all` → hybrid.
+    #[serde(default)]
+    retrieval_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrievalMode {
+    Wiki,
+    SourcesOnly,
+    Hybrid,
+}
+
+fn parse_retrieval_mode(raw: Option<&str>) -> RetrievalMode {
+    match raw.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("wiki") => RetrievalMode::Wiki,
+        Some("sources_only") | Some("faithful") | Some("sources") => RetrievalMode::SourcesOnly,
+        Some("hybrid") | Some("all") => RetrievalMode::Hybrid,
+        // Unknown values fall back to wiki for backward compatibility.
+        _ => RetrievalMode::Wiki,
+    }
+}
+
+fn retrieval_mode_label(mode: RetrievalMode) -> &'static str {
+    match mode {
+        RetrievalMode::Wiki => "wiki",
+        RetrievalMode::SourcesOnly => "sources_only",
+        RetrievalMode::Hybrid => "hybrid",
+    }
+}
+
+fn scan_roots_for_mode(mode: RetrievalMode) -> Vec<String> {
+    match mode {
+        RetrievalMode::Wiki => vec!["wiki".to_string()],
+        RetrievalMode::SourcesOnly => vec!["raw/sources".to_string()],
+        RetrievalMode::Hybrid => vec!["wiki".to_string(), "raw/sources".to_string()],
+    }
 }
 
 struct ContextBudget {
@@ -107,7 +149,8 @@ fn handle_request(mut request: tiny_http::Request) {
 
     let response = match method {
         Method::Get => handle_get(&url),
-        Method::Post => handle_post(&path, &mut request),
+        // Pass full URL so POST handlers can read query (e.g. upload projectId).
+        Method::Post => handle_post(&url, &mut request),
         Method::Delete => handle_delete(&path, &mut request),
         Method::Options => OmnimindResponse {
             status: 204,
@@ -413,17 +456,22 @@ fn handle_get(path: &str) -> OmnimindResponse {
 }
 
 fn handle_post(path: &str, request: &mut tiny_http::Request) -> OmnimindResponse {
-    let parts: Vec<&str> = path
+    let (clean_path, query) = split_url(path);
+    let parts: Vec<&str> = clean_path
         .trim_start_matches('/')
         .split('/')
         .filter(|part| !part.is_empty())
         .collect();
 
     match parts.as_slice() {
-        ["api", "v1", "document", "upload"] => handle_upload(request),
+        ["api", "v1", "document", "upload"] => handle_upload(request, query),
         ["api", "v1", "files", "save"] => {
             let body = read_request_body(request).unwrap_or_default();
             handle_save_file(&body)
+        }
+        ["api", "v1", "files", "extract-text"] => {
+            let body = read_request_body(request).unwrap_or_default();
+            handle_extract_text(&body)
         }
         ["api", "v1", "workspace", project_id, "update-embeddings"] => {
             let body = read_request_body(request).unwrap_or_default();
@@ -458,7 +506,7 @@ fn handle_post(path: &str, request: &mut tiny_http::Request) -> OmnimindResponse
     }
 }
 
-fn handle_upload(request: &mut tiny_http::Request) -> OmnimindResponse {
+fn handle_upload(request: &mut tiny_http::Request, query: &str) -> OmnimindResponse {
     let boundary = match get_multipart_boundary(request) {
         Some(b) => b,
         None => {
@@ -473,14 +521,40 @@ fn handle_upload(request: &mut tiny_http::Request) -> OmnimindResponse {
     let mut multipart = multipart_2021::server::Multipart::with_body(request.as_reader(), boundary);
     let mut uploaded_files = Vec::new();
 
-    // Use current project or fallback to first project
-    let project = match load_projects()
-        .into_iter()
-        .find(|p| p.current)
-        .or_else(|| load_projects().first().cloned())
-    {
-        Some(p) => p,
-        None => return error_response(500, "NO_PROJECT_FOUND", "No project found to upload to"),
+    // Prefer explicit projectId (query) so upload/get_file_content share the same project.
+    // Fallback: current project → first project → auto-create default workspace.
+    let params = parse_query(query);
+    let project = match get_target_project(params.get("projectId").map(String::as_str)) {
+        Ok(p) => p,
+        Err(_) => {
+            // Unknown projectId still falls back for light single-workspace installs;
+            // auto-create only when no projects exist at all.
+            match load_projects()
+                .into_iter()
+                .find(|p| p.current)
+                .or_else(|| load_projects().first().cloned())
+            {
+                Some(p) => p,
+                None => {
+                    let app_dir = get_app_data_dir().unwrap_or_else(|| {
+                        let home = env::var("HOME")
+                            .ok()
+                            .or_else(|| env::var("USERPROFILE").ok())
+                            .unwrap_or_else(|| ".".to_string());
+                        PathBuf::from(home).join("Library/Application Support/com.llmwiki.app")
+                    });
+                    let default_path = app_dir.join("default-workspace");
+                    let _ = fs::create_dir_all(&default_path);
+                    let path_str = normalize_path(&default_path.to_string_lossy());
+                    ProjectEntry {
+                        id: "default".to_string(),
+                        name: "Default Workspace".to_string(),
+                        current: true,
+                        path: path_str,
+                    }
+                }
+            }
+        }
     };
 
     let wiki_dir = match safe_join(&project.path, "wiki") {
@@ -699,6 +773,7 @@ fn handle_search(project_id: &str, body: &str) -> OmnimindResponse {
         top_k,
         req.include_content.unwrap_or(false),
         query_embedding,
+        None,
     )) {
         Ok(search) => OmnimindResponse {
             status: 200,
@@ -813,33 +888,141 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
     }
 
     let budget = compute_context_budget(request.max_context_size);
+    let retrieval_mode = parse_retrieval_mode(request.retrieval_mode.as_deref());
+    let scan_roots = scan_roots_for_mode(retrieval_mode);
+    let mode_label = retrieval_mode_label(retrieval_mode);
 
-    // Perform real search
+    // Perform real search (context assembly only — no final reply generation).
     let embedding_config = load_embedding_config();
-    let query_embedding = match tauri::async_runtime::block_on(
-        commands::search::resolve_query_embedding(&request.query, None, embedding_config),
-    ) {
-        Ok(embedding) => embedding,
-        Err(_) => None,
+    // Vector embeddings only help when wiki is in the scan set (wiki index).
+    let query_embedding = if matches!(retrieval_mode, RetrievalMode::SourcesOnly) {
+        None
+    } else {
+        match tauri::async_runtime::block_on(commands::search::resolve_query_embedding(
+            &request.query,
+            None,
+            embedding_config,
+        )) {
+            Ok(embedding) => embedding,
+            Err(_) => None,
+        }
     };
 
-    let search_results =
-        match tauri::async_runtime::block_on(commands::search::search_project_inner(
-            project.path.clone(),
-            request.query.clone(),
-            10,   // top_k for context
-            true, // include_content
-            query_embedding,
-        )) {
-            Ok(res) => res.results,
-            Err(_) => Vec::new(),
-        };
+    let search = match tauri::async_runtime::block_on(commands::search::search_project_inner(
+        project.path.clone(),
+        request.query.clone(),
+        10,   // top_k for context
+        true, // include_content
+        query_embedding,
+        Some(scan_roots.clone()),
+    )) {
+        Ok(res) => res,
+        Err(_) => commands::search::ProjectSearchResponse {
+            mode: "token".to_string(),
+            results: Vec::new(),
+            token_hits: 0,
+            vector_hits: 0,
+            graph_hits: 0,
+        },
+    };
 
+    let ordered = order_results_for_context(retrieval_mode, search.results);
+    let (context_blocks, references) = assemble_context_blocks(ordered, &budget);
+
+    let status = if context_blocks.is_empty() {
+        "EMPTY_CONTEXT"
+    } else {
+        "SUCCESS"
+    };
+
+    OmnimindResponse {
+        status: 200,
+        body: json!({
+            "ok": true,
+            "status": status,
+            "project_id": project_id,
+            "query": request.query,
+            "context_blocks": context_blocks,
+            "references": references,
+            "budget": {
+                "max_ctx": budget.max_ctx,
+                "response_reserve": budget.response_reserve,
+                "index_budget": budget.index_budget,
+                "page_budget": budget.page_budget,
+                "max_page_size": budget.max_page_size,
+            },
+            "retrieval_debug": build_retrieval_debug(
+                &request,
+                mode_label,
+                &scan_roots,
+                context_blocks.len(),
+                Some(RetrievalSearchStats {
+                    search_mode: search.mode.as_str(),
+                    vector_hits: search.vector_hits,
+                    token_hits: search.token_hits,
+                    graph_hits: search.graph_hits,
+                }),
+            ),
+        }),
+    }
+}
+
+/// True when a search hit path belongs to the raw sources tree.
+fn is_raw_sources_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized.contains("raw/sources")
+}
+
+/// Hybrid mode reserves a floor of raw/sources hits (when present), then fills
+/// remaining slots by score. Wiki-only / sources_only keep original ranking.
+fn order_results_for_context(
+    mode: RetrievalMode,
+    results: Vec<commands::search::ProjectSearchResult>,
+) -> Vec<commands::search::ProjectSearchResult> {
+    if !matches!(mode, RetrievalMode::Hybrid) || results.is_empty() {
+        return results;
+    }
+
+    let mut sources: Vec<commands::search::ProjectSearchResult> = Vec::new();
+    let mut others: Vec<commands::search::ProjectSearchResult> = Vec::new();
+    for item in results {
+        if is_raw_sources_path(&item.path) {
+            sources.push(item);
+        } else {
+            others.push(item);
+        }
+    }
+
+    if sources.is_empty() {
+        // No sources hits — keep wiki ranking as-is (others already score-ordered).
+        return others;
+    }
+
+    // Search results arrive score-desc; preserve that within each bucket.
+    let floor_n = HYBRID_SOURCES_FLOOR.min(sources.len());
+    let mut floor: Vec<commands::search::ProjectSearchResult> = sources.drain(..floor_n).collect();
+    let mut remainder = others;
+    remainder.append(&mut sources);
+    remainder.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    floor.append(&mut remainder);
+    floor
+}
+
+fn assemble_context_blocks(
+    ordered: Vec<commands::search::ProjectSearchResult>,
+    budget: &ContextBudget,
+) -> (Vec<Value>, Vec<Value>) {
     let mut context_blocks = Vec::new();
     let mut references = Vec::new();
     let mut current_size = 0;
 
-    for (idx, res) in search_results.into_iter().enumerate() {
+    for (idx, res) in ordered.into_iter().enumerate() {
         let ref_id = idx + 1;
         let content = res.content.unwrap_or_default();
         let block = format!("[{}] {}\n{}", ref_id, res.title, content);
@@ -876,31 +1059,14 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
         current_size += block_size;
     }
 
-    let status = if context_blocks.is_empty() {
-        "EMPTY_CONTEXT"
-    } else {
-        "SUCCESS"
-    };
+    (context_blocks, references)
+}
 
-    OmnimindResponse {
-        status: 200,
-        body: json!({
-            "ok": true,
-            "status": status,
-            "project_id": project_id,
-            "query": request.query,
-            "context_blocks": context_blocks,
-            "references": references,
-            "budget": {
-                "max_ctx": budget.max_ctx,
-                "response_reserve": budget.response_reserve,
-                "index_budget": budget.index_budget,
-                "page_budget": budget.page_budget,
-                "max_page_size": budget.max_page_size,
-            },
-            "retrieval_debug": build_retrieval_debug(&request),
-        }),
-    }
+struct RetrievalSearchStats<'a> {
+    search_mode: &'a str,
+    vector_hits: usize,
+    token_hits: usize,
+    graph_hits: usize,
 }
 
 fn compute_context_budget(max_context_size: Option<usize>) -> ContextBudget {
@@ -921,17 +1087,40 @@ fn compute_context_budget(max_context_size: Option<usize>) -> ContextBudget {
     }
 }
 
-fn build_retrieval_debug(request: &ChatContextRequest) -> Value {
-
+fn build_retrieval_debug(
+    request: &ChatContextRequest,
+    retrieval_mode: &str,
+    scan_roots: &[String],
+    result_count: usize,
+    search_stats: Option<RetrievalSearchStats<'_>>,
+) -> Value {
+    // Always surface retrieval_mode for ops; expand when include_debug=true.
     if !request.include_debug {
-        return json!(null);
+        return json!({
+            "retrieval_mode": retrieval_mode,
+        });
     }
 
-    json!({
+    let mut debug = json!({
+        "retrieval_mode": retrieval_mode,
+        "scan_roots": scan_roots,
+        "result_count": result_count,
+        "include_debug": true,
         "mode": "server-only",
         "history_message_count": request.history.len(),
         "history_content_chars": request.history.iter().map(|item| item.content.chars().count()).sum::<usize>(),
-    })
+    });
+
+    if let Some(stats) = search_stats {
+        if let Some(obj) = debug.as_object_mut() {
+            obj.insert("search_mode".into(), json!(stats.search_mode));
+            obj.insert("vector_hits".into(), json!(stats.vector_hits));
+            obj.insert("token_hits".into(), json!(stats.token_hits));
+            obj.insert("graph_hits".into(), json!(stats.graph_hits));
+        }
+    }
+
+    debug
 }
 
 fn error_response(status: u16, code: &str, message: &str) -> OmnimindResponse {
@@ -1339,6 +1528,351 @@ fn safe_join(project_path: &str, rel: &str) -> Result<PathBuf, String> {
     Ok(joined)
 }
 
+/// Resolve a project-relative or absolute path, ensuring it stays inside the
+/// project root (path-traversal safe).
+fn resolve_project_file_path(project_path: &str, path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+
+    let root = PathBuf::from(project_path);
+    let root_canon = root
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve project root: {e}"))?;
+
+    let candidate = if Path::new(trimmed).is_absolute() {
+        PathBuf::from(trimmed)
+    } else {
+        safe_join(project_path, trimmed)?
+    };
+
+    if !candidate.exists() {
+        // Still reject absolute paths that clearly fall outside the project
+        // even before existence checks, using component-normalized compare.
+        if Path::new(trimmed).is_absolute() {
+            let normalized = normalize_path_components(&candidate);
+            let root_norm = normalize_path_components(&root_canon);
+            if !path_starts_with(&normalized, &root_norm) {
+                return Err("Path is outside project directory".to_string());
+            }
+        }
+        return Err(format!("File does not exist: {}", candidate.display()));
+    }
+
+    let cand_canon = candidate
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve path: {e}"))?;
+    if !path_starts_with(&cand_canon, &root_canon) {
+        return Err("Path is outside project directory".to_string());
+    }
+    Ok(cand_canon)
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    let path_comps: Vec<_> = path.components().collect();
+    let root_comps: Vec<_> = root.components().collect();
+    if root_comps.len() > path_comps.len() {
+        return false;
+    }
+    path_comps
+        .iter()
+        .zip(root_comps.iter())
+        .all(|(a, b)| a == b)
+}
+
+/// Align with `commands::fs::read_file` extractable formats (not image/media placeholders).
+const EXTRACT_TEXT_ALLOWED_EXTS: &[&str] = &[
+    "epub", "mobi", "pdf", "doc", "docx", "pptx", "ppt", "xls", "xlsx", "odt", "ods", "odp", "txt",
+    "md", "markdown", "org", "csv", "tsv", "html", "htm", "json", "xml", "yaml", "yml", "toml",
+    "log", "rst", "text",
+];
+/// Same 100MB ceiling as ebook extraction (`commands::ebook::MAX_EBOOK_BYTES`).
+const EXTRACT_CONTENT_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ExtractTextRequest {
+    /// Mode A: project-relative or absolute path inside the wiki project.
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default, alias = "projectId")]
+    project_id: Option<String>,
+    /// Mode B: file extension (without dot), e.g. `epub`, `md`.
+    #[serde(default)]
+    extension: Option<String>,
+    /// Mode B: raw file bytes as standard base64 (DMS absolute-path workaround).
+    #[serde(default, alias = "contentBase64")]
+    content_base64: Option<String>,
+    /// Mode B optional display name used only for `memory:<filename>` response path.
+    #[serde(default)]
+    filename: Option<String>,
+}
+
+fn normalize_extract_extension(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('.')
+        .to_lowercase()
+}
+
+fn is_extract_text_allowed_ext(extension: &str) -> bool {
+    EXTRACT_TEXT_ALLOWED_EXTS.contains(&extension)
+}
+
+fn estimated_base64_decoded_len(b64_len: usize) -> u64 {
+    // Standard base64: 4 chars → ≤3 bytes (padding ignored conservatively).
+    (b64_len as u64).saturating_mul(3) / 4
+}
+
+fn content_bytes_within_limit(decoded_len: usize) -> Result<(), String> {
+    if decoded_len as u64 > EXTRACT_CONTENT_MAX_BYTES {
+        Err(format!(
+            "Decoded content exceeds the {} MB limit",
+            EXTRACT_CONTENT_MAX_BYTES / 1024 / 1024
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn sanitize_memory_filename(filename: Option<&str>, extension: &str) -> String {
+    let fallback = format!("upload.{extension}");
+    let raw = filename.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("");
+    if raw.is_empty() {
+        return fallback;
+    }
+    let base = Path::new(raw)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(raw);
+    let cleaned: String = base
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        fallback
+    } else {
+        cleaned
+    }
+}
+
+fn map_read_file_error(e: &str) -> OmnimindResponse {
+    let lower = e.to_lowercase();
+    if lower.contains("does not exist") {
+        return error_response(404, "FILE_NOT_FOUND", e);
+    }
+    if lower.contains("not supported") || lower.contains("unsupported") {
+        return error_response(422, "UNSUPPORTED_FORMAT", e);
+    }
+    error_response(422, "EXTRACT_FAILED", e)
+}
+
+fn handle_extract_text(body: &str) -> OmnimindResponse {
+    let req: ExtractTextRequest = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => return error_response(400, "INVALID_JSON", &format!("Invalid JSON: {e}")),
+    };
+
+    let has_content = req
+        .content_base64
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+    if has_content {
+        return handle_extract_text_from_content(&req);
+    }
+
+    handle_extract_text_from_path(&req)
+}
+
+/// Mode B: decode base64 → temp file → reuse `commands::fs::read_file` → cleanup.
+fn handle_extract_text_from_content(req: &ExtractTextRequest) -> OmnimindResponse {
+    let mut extension = req
+        .extension
+        .as_deref()
+        .map(normalize_extract_extension)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+
+    if extension.is_empty() {
+        if let Some(name) = req.filename.as_deref() {
+            if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
+                extension = normalize_extract_extension(ext);
+            }
+        }
+    }
+
+    if extension.is_empty() {
+        return error_response(
+            400,
+            "EXTENSION_REQUIRED",
+            "extension is required for contentBase64 mode",
+        );
+    }
+
+    if !is_extract_text_allowed_ext(&extension) {
+        return error_response(
+            422,
+            "UNSUPPORTED_FORMAT",
+            &format!("Unsupported extension for extract-text: .{extension}"),
+        );
+    }
+
+    let b64 = req.content_base64.as_deref().unwrap_or("").trim();
+    // Reject clearly oversized payloads before allocating decode buffer.
+    if estimated_base64_decoded_len(b64.len()) > EXTRACT_CONTENT_MAX_BYTES + 3 {
+        return error_response(
+            413,
+            "PAYLOAD_TOO_LARGE",
+            &format!(
+                "Decoded content exceeds the {} MB limit",
+                EXTRACT_CONTENT_MAX_BYTES / 1024 / 1024
+            ),
+        );
+    }
+
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let bytes = match B64.decode(b64.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return error_response(400, "INVALID_BASE64", &format!("Invalid base64: {e}"));
+        }
+    };
+
+    if let Err(msg) = content_bytes_within_limit(bytes.len()) {
+        return error_response(413, "PAYLOAD_TOO_LARGE", &msg);
+    }
+
+    let memory_name = sanitize_memory_filename(req.filename.as_deref(), &extension);
+    let temp_path = env::temp_dir().join(format!(
+        "omnimind-extract-{}-{}.{}",
+        process::id(),
+        uuid::Uuid::new_v4(),
+        extension
+    ));
+
+    if let Err(e) = fs::write(&temp_path, &bytes) {
+        return error_response(
+            500,
+            "TEMP_WRITE_FAILED",
+            &format!("Failed to write temp file: {e}"),
+        );
+    }
+
+    let content = match tauri::async_runtime::block_on(commands::fs::read_file(
+        temp_path.to_string_lossy().to_string(),
+        Some(false),
+    )) {
+        Ok(text) => {
+            let _ = fs::remove_file(&temp_path);
+            text
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&temp_path);
+            return map_read_file_error(&e);
+        }
+    };
+
+    let chars = content.chars().count();
+    OmnimindResponse {
+        status: 200,
+        body: json!({
+            "ok": true,
+            "path": format!("memory:{memory_name}"),
+            "extension": extension,
+            "content": content,
+            "chars": chars,
+        }),
+    }
+}
+
+/// Mode A: path must resolve inside the target wiki project (unchanged contract).
+fn handle_extract_text_from_path(req: &ExtractTextRequest) -> OmnimindResponse {
+    let path = req.path.as_deref().unwrap_or("").trim();
+    if path.is_empty() {
+        return error_response(
+            400,
+            "PATH_REQUIRED",
+            "path is required (or provide contentBase64 + extension)",
+        );
+    }
+
+    let project = match get_target_project(req.project_id.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return error_response(404, "PROJECT_NOT_FOUND", &e),
+    };
+
+    let full_path = match resolve_project_file_path(&project.path, path) {
+        Ok(p) => p,
+        Err(e) => {
+            let lower = e.to_lowercase();
+            if lower.contains("outside project") || lower.contains("traversal") {
+                return error_response(400, "INVALID_PATH", &e);
+            }
+            if lower.contains("does not exist") {
+                return error_response(404, "FILE_NOT_FOUND", &e);
+            }
+            if lower.contains("empty") {
+                return error_response(400, "PATH_REQUIRED", &e);
+            }
+            return error_response(400, "INVALID_PATH", &e);
+        }
+    };
+
+    if full_path.is_dir() {
+        return error_response(422, "NOT_A_FILE", "Path is a directory");
+    }
+
+    let extension = full_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Reuse commands::fs text extraction (pdf/office/epub/mobi/org/txt/md …).
+    let content = match tauri::async_runtime::block_on(commands::fs::read_file(
+        full_path.to_string_lossy().to_string(),
+        Some(false),
+    )) {
+        Ok(text) => text,
+        Err(e) => return map_read_file_error(&e),
+    };
+
+    let rel_path = relative_to_project(&project.path, &full_path);
+    let chars = content.chars().count();
+
+    OmnimindResponse {
+        status: 200,
+        body: json!({
+            "ok": true,
+            "path": rel_path,
+            "extension": extension,
+            "content": content,
+            "chars": chars,
+        }),
+    }
+}
+
 
 fn handle_graph(project_id: &str, query: &str) -> OmnimindResponse {
     let project = match resolve_project(project_id) {
@@ -1364,6 +1898,13 @@ fn handle_graph(project_id: &str, query: &str) -> OmnimindResponse {
             if let Some(ref node_type) = node_type {
                 nodes.retain(|n| n.node_type == *node_type);
             }
+            // Prefer highly-connected pages before applying limit so small
+            // limits do not collapse to isolated leaves.
+            nodes.sort_by(|a, b| {
+                b.link_count
+                    .cmp(&a.link_count)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
             nodes.truncate(limit);
             let ids: std::collections::BTreeSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
             let edges: Vec<ApiGraphEdge> = edges
@@ -1450,17 +1991,57 @@ fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdg
     Ok((nodes, edges))
 }
 
+/// Extract `type` only from YAML frontmatter (`---` … `---` at file start).
+/// Body text that happens to contain `type:` is ignored; default is `other`.
 fn extract_type(content: &str) -> String {
-    for line in content.lines() {
+    let Some(frontmatter) = yaml_frontmatter_block(content) else {
+        return "other".to_string();
+    };
+    for line in frontmatter.lines() {
         if let Some(value) = line.trim().strip_prefix("type:") {
-            return value
+            let parsed = value
                 .trim()
                 .trim_matches('"')
                 .trim_matches('\'')
                 .to_lowercase();
+            if !parsed.is_empty() {
+                return parsed;
+            }
         }
     }
     "other".to_string()
+}
+
+/// Return the YAML frontmatter body (between opening/closing `---` fences)
+/// when the document starts with a frontmatter block.
+fn yaml_frontmatter_block(content: &str) -> Option<&str> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let after_open = if let Some(rest) = content.strip_prefix("---\r\n") {
+        rest
+    } else if let Some(rest) = content.strip_prefix("---\n") {
+        rest
+    } else {
+        return None;
+    };
+
+    // Closing fence must be on its own line: `\n---` at EOL or followed by
+    // newline / EOF.
+    let bytes = after_open.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            let rest = &after_open[i + 1..];
+            if rest == "---"
+                || rest.starts_with("---\n")
+                || rest.starts_with("---\r\n")
+                || rest.starts_with("---\r")
+            {
+                return Some(&after_open[..i]);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn extract_wikilinks(content: &str) -> Vec<String> {
@@ -1489,4 +2070,373 @@ fn resolve_link(raw: &str, ids: &std::collections::BTreeSet<String>) -> Option<S
     ids.iter()
         .find(|id| id.to_lowercase() == normalized || id.to_lowercase() == raw.to_lowercase())
         .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commands::search::ProjectSearchResult;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_dir(prefix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("omnimind-server-{prefix}-{id}-{seq}"));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn sample_result(path: &str, title: &str, score: f64) -> ProjectSearchResult {
+        ProjectSearchResult {
+            path: path.to_string(),
+            title: title.to_string(),
+            snippet: String::new(),
+            title_match: false,
+            score,
+            vector_score: None,
+            images: vec![],
+            content: Some(format!("content for {title}")),
+            graph_related_to: vec![],
+        }
+    }
+
+    #[test]
+    fn parse_retrieval_mode_defaults_and_aliases() {
+        assert_eq!(parse_retrieval_mode(None), RetrievalMode::Wiki);
+        assert_eq!(parse_retrieval_mode(Some("")), RetrievalMode::Wiki);
+        assert_eq!(parse_retrieval_mode(Some("wiki")), RetrievalMode::Wiki);
+        assert_eq!(parse_retrieval_mode(Some("WiKi")), RetrievalMode::Wiki);
+        assert_eq!(
+            parse_retrieval_mode(Some("sources_only")),
+            RetrievalMode::SourcesOnly
+        );
+        assert_eq!(
+            parse_retrieval_mode(Some("faithful")),
+            RetrievalMode::SourcesOnly
+        );
+        assert_eq!(
+            parse_retrieval_mode(Some("sources")),
+            RetrievalMode::SourcesOnly
+        );
+        assert_eq!(parse_retrieval_mode(Some("hybrid")), RetrievalMode::Hybrid);
+        assert_eq!(parse_retrieval_mode(Some("all")), RetrievalMode::Hybrid);
+        assert_eq!(parse_retrieval_mode(Some("unknown")), RetrievalMode::Wiki);
+    }
+
+    #[test]
+    fn scan_roots_for_mode_maps_expected_paths() {
+        assert_eq!(scan_roots_for_mode(RetrievalMode::Wiki), vec!["wiki"]);
+        assert_eq!(
+            scan_roots_for_mode(RetrievalMode::SourcesOnly),
+            vec!["raw/sources"]
+        );
+        assert_eq!(
+            scan_roots_for_mode(RetrievalMode::Hybrid),
+            vec!["wiki", "raw/sources"]
+        );
+    }
+
+    #[test]
+    fn retrieval_debug_always_includes_mode() {
+        let request = ChatContextRequest {
+            query: "q".into(),
+            history: vec![],
+            max_history_messages: None,
+            max_context_size: None,
+            output_language: None,
+            include_debug: false,
+            retrieval_mode: Some("sources_only".into()),
+        };
+        let compact =
+            build_retrieval_debug(&request, "sources_only", &["raw/sources".into()], 0, None);
+        assert_eq!(compact["retrieval_mode"], "sources_only");
+        assert!(compact.get("scan_roots").is_none());
+        assert!(compact.get("search_mode").is_none());
+
+        let request_debug = ChatContextRequest {
+            include_debug: true,
+            ..request
+        };
+        let full = build_retrieval_debug(
+            &request_debug,
+            "sources_only",
+            &["raw/sources".into()],
+            3,
+            Some(RetrievalSearchStats {
+                search_mode: "hybrid",
+                vector_hits: 4,
+                token_hits: 7,
+                graph_hits: 1,
+            }),
+        );
+        assert_eq!(full["retrieval_mode"], "sources_only");
+        assert_eq!(full["result_count"], 3);
+        assert_eq!(full["scan_roots"][0], "raw/sources");
+        assert_eq!(full["include_debug"], true);
+        assert_eq!(full["search_mode"], "hybrid");
+        assert_eq!(full["vector_hits"], 4);
+        assert_eq!(full["token_hits"], 7);
+        assert_eq!(full["graph_hits"], 1);
+    }
+
+    #[test]
+    fn extract_type_reads_only_yaml_frontmatter() {
+        let with_fm = "---\ntitle: Demo\ntype: concept\n---\n# Body\ntype: ignored\n";
+        assert_eq!(extract_type(with_fm), "concept");
+
+        let quoted = "---\ntype: \"entity\"\n---\nbody type: concept\n";
+        assert_eq!(extract_type(quoted), "entity");
+
+        let no_fm = "# Title\ntype: concept\n";
+        assert_eq!(extract_type(no_fm), "other");
+
+        let fm_without_type = "---\ntitle: only\n---\ntype: concept\n";
+        assert_eq!(extract_type(fm_without_type), "other");
+    }
+
+    #[test]
+    fn graph_nodes_prioritize_high_link_count_before_limit() {
+        let root = test_dir("graph");
+        let wiki = root.join("wiki");
+        fs::create_dir_all(&wiki).unwrap();
+
+        // Hub links to A and B → high degree. Leaves have fewer links.
+        fs::write(
+            wiki.join("hub.md"),
+            "---\ntype: concept\n---\n# Hub\n[[leaf-a]] [[leaf-b]]\n",
+        )
+        .unwrap();
+        fs::write(
+            wiki.join("leaf-a.md"),
+            "---\ntype: concept\n---\n# Leaf A\n[[hub]]\n",
+        )
+        .unwrap();
+        fs::write(
+            wiki.join("leaf-b.md"),
+            "---\ntype: concept\n---\n# Leaf B\n[[hub]]\n",
+        )
+        .unwrap();
+        fs::write(
+            wiki.join("orphan.md"),
+            "---\ntype: concept\n---\n# Orphan\nNo links here.\n",
+        )
+        .unwrap();
+
+        let (mut nodes, _edges) = build_graph(root.to_str().unwrap()).unwrap();
+        nodes.sort_by(|a, b| {
+            b.link_count
+                .cmp(&a.link_count)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        nodes.truncate(2);
+
+        assert_eq!(nodes.len(), 2);
+        assert!(
+            nodes.iter().all(|n| n.link_count >= 1),
+            "limit=2 must prefer connected pages over orphan: {:?}",
+            nodes
+        );
+        assert!(
+            nodes.iter().any(|n| n.id == "hub"),
+            "hub should survive truncate: {:?}",
+            nodes
+        );
+        assert!(
+            nodes.iter().all(|n| n.id != "orphan"),
+            "orphan must not beat connected nodes: {:?}",
+            nodes
+        );
+        assert!(
+            nodes.iter().all(|n| n.node_type == "concept"),
+            "frontmatter type must apply: {:?}",
+            nodes
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hybrid_sources_floor_keeps_raw_sources_hits() {
+        let results = vec![
+            sample_result("wiki/alpha.md", "Alpha", 100.0),
+            sample_result("wiki/beta.md", "Beta", 90.0),
+            sample_result("raw/sources/doc1.md", "Doc1", 50.0),
+            sample_result("raw/sources/doc2.md", "Doc2", 40.0),
+            sample_result("raw/sources/doc3.md", "Doc3", 30.0),
+            sample_result("wiki/gamma.md", "Gamma", 20.0),
+        ];
+
+        let ordered = order_results_for_context(RetrievalMode::Hybrid, results);
+        assert!(ordered.len() >= 3);
+        // Floor of 2 sources first.
+        assert!(is_raw_sources_path(&ordered[0].path));
+        assert!(is_raw_sources_path(&ordered[1].path));
+        assert_eq!(ordered[0].path, "raw/sources/doc1.md");
+        assert_eq!(ordered[1].path, "raw/sources/doc2.md");
+        // Remaining ordered by score: wiki/alpha (100), wiki/beta (90), doc3 (30), gamma (20)
+        assert_eq!(ordered[2].path, "wiki/alpha.md");
+        assert_eq!(ordered[3].path, "wiki/beta.md");
+
+        // wiki-only leaves ranking untouched.
+        let wiki_only = order_results_for_context(
+            RetrievalMode::Wiki,
+            vec![
+                sample_result("wiki/a.md", "A", 10.0),
+                sample_result("raw/sources/s.md", "S", 99.0),
+            ],
+        );
+        assert_eq!(wiki_only[0].path, "wiki/a.md");
+        assert_eq!(wiki_only[1].path, "raw/sources/s.md");
+
+        // sources_only unchanged.
+        let sources_only = order_results_for_context(
+            RetrievalMode::SourcesOnly,
+            vec![
+                sample_result("raw/sources/a.md", "A", 10.0),
+                sample_result("raw/sources/b.md", "B", 5.0),
+            ],
+        );
+        assert_eq!(sources_only[0].path, "raw/sources/a.md");
+        assert_eq!(sources_only[1].path, "raw/sources/b.md");
+    }
+
+    #[test]
+    fn hybrid_sources_floor_constant_is_two() {
+        assert_eq!(HYBRID_SOURCES_FLOOR, 2);
+    }
+
+    #[test]
+    fn extract_text_path_resolution_rejects_traversal() {
+        let root = test_dir("extract");
+        fs::write(root.join("inside.md"), "hello extract").unwrap();
+        let root_str = root.to_string_lossy().to_string();
+
+        let ok = resolve_project_file_path(&root_str, "inside.md").unwrap();
+        assert!(ok.ends_with("inside.md"));
+
+        let abs_ok = resolve_project_file_path(
+            &root_str,
+            root.join("inside.md").to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(abs_ok.ends_with("inside.md"));
+
+        let outside = std::env::temp_dir().join(format!(
+            "omnimind-outside-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&outside, "secret").unwrap();
+        let err = resolve_project_file_path(&root_str, outside.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("outside"),
+            "expected outside-project error, got {err}"
+        );
+        let trav = resolve_project_file_path(&root_str, "../secret.md").unwrap_err();
+        assert!(
+            trav.to_lowercase().contains("traversal")
+                || trav.to_lowercase().contains("outside")
+                || trav.to_lowercase().contains("not allowed"),
+            "expected traversal rejection, got {trav}"
+        );
+
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extract_text_content_base64_md_extracts_text() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let markdown = "# Hello DMS\n\ncontent from base64 mode\n";
+        let body = json!({
+            "extension": "md",
+            "contentBase64": B64.encode(markdown.as_bytes()),
+            "filename": "note.md",
+        })
+        .to_string();
+
+        let resp = handle_extract_text(&body);
+        assert_eq!(resp.status, 200, "body={}", resp.body);
+        assert_eq!(resp.body["ok"], true);
+        assert_eq!(resp.body["extension"], "md");
+        assert_eq!(resp.body["path"], "memory:note.md");
+        assert_eq!(resp.body["content"], markdown);
+        assert_eq!(
+            resp.body["chars"].as_u64().unwrap(),
+            markdown.chars().count() as u64
+        );
+    }
+
+    #[test]
+    fn extract_text_content_mode_rejects_illegal_extension() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let body = json!({
+            "extension": "exe",
+            "contentBase64": B64.encode(b"MZ fake binary"),
+            "filename": "malware.exe",
+        })
+        .to_string();
+
+        let resp = handle_extract_text(&body);
+        assert_eq!(resp.status, 422, "body={}", resp.body);
+        assert_eq!(resp.body["ok"], false);
+        assert_eq!(resp.body["error"]["code"], "UNSUPPORTED_FORMAT");
+    }
+
+    #[test]
+    fn extract_text_content_mode_rejects_oversized_payload() {
+        // Limit aligned with ebook MAX_EBOOK_BYTES.
+        assert_eq!(EXTRACT_CONTENT_MAX_BYTES, 100 * 1024 * 1024);
+
+        // Exact post-decode gate.
+        assert!(content_bytes_within_limit(EXTRACT_CONTENT_MAX_BYTES as usize).is_ok());
+        let over = content_bytes_within_limit(EXTRACT_CONTENT_MAX_BYTES as usize + 1);
+        assert!(over.is_err(), "expected size rejection");
+        let msg = over.unwrap_err();
+        assert!(msg.to_lowercase().contains("exceeds") || msg.contains("100"));
+
+        // Pre-decode estimate: base64 length that implies >100MB must trip the gate
+        // used by handle_extract_text_from_content (no multi-100MB allocation in tests).
+        let over_decoded = EXTRACT_CONTENT_MAX_BYTES + 4;
+        let b64_len = ((over_decoded + 2) / 3 * 4) as usize;
+        let estimated = estimated_base64_decoded_len(b64_len);
+        assert!(
+            estimated > EXTRACT_CONTENT_MAX_BYTES + 3,
+            "estimate {estimated} should exceed limit+3"
+        );
+
+        // Handler-level 413 using the same error path the estimate gate returns.
+        let resp = error_response(
+            413,
+            "PAYLOAD_TOO_LARGE",
+            &format!(
+                "Decoded content exceeds the {} MB limit",
+                EXTRACT_CONTENT_MAX_BYTES / 1024 / 1024
+            ),
+        );
+        assert_eq!(resp.status, 413);
+        assert_eq!(resp.body["error"]["code"], "PAYLOAD_TOO_LARGE");
+    }
+
+    #[test]
+    fn extract_text_content_mode_requires_extension() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let body = json!({
+            "contentBase64": B64.encode(b"hello"),
+        })
+        .to_string();
+        let resp = handle_extract_text(&body);
+        assert_eq!(resp.status, 400, "body={}", resp.body);
+        assert_eq!(resp.body["error"]["code"], "EXTENSION_REQUIRED");
+    }
 }

@@ -646,6 +646,7 @@ fn tool_top_k(input: &Value) -> usize {
         .clamp(1, 10)
 }
 
+#[allow(dead_code)]
 pub fn write_wiki_page_with_options(
     project_path: &str,
     rel_path: &str,
@@ -835,6 +836,7 @@ pub async fn run_wiki_search(
         top_k,
         include_content,
         query_embedding,
+        None,
     )
     .await?;
     let project_for_context = project_path.clone();

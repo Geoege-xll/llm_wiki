@@ -44,6 +44,7 @@ pub fn all_projects() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+#[allow(unused_assignments)]
 pub fn start_clip_server(app: AppHandle) {
     thread::spawn(move || {
         let mut restart_count: u32 = 0;

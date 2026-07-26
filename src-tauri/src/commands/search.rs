@@ -118,6 +118,7 @@ pub async fn search_project(
             top_k.unwrap_or(DEFAULT_RESULTS),
             include_content.unwrap_or(false),
             query_embedding,
+            None,
         )
         .await
     })
@@ -320,12 +321,49 @@ fn validate_query_embedding(embedding: Vec<f32>) -> Result<Vec<f32>, String> {
     Ok(embedding)
 }
 
+/// Normalize scan roots for project-relative retrieval.
+/// Defaults to `["wiki"]`. Unknown/unsafe roots are dropped; empty falls back to wiki.
+pub fn normalize_scan_roots(scan_roots: Option<Vec<String>>) -> Vec<String> {
+    let candidates = match scan_roots {
+        Some(roots) if !roots.is_empty() => roots,
+        _ => vec!["wiki".to_string()],
+    };
+    let mut out = Vec::new();
+    for root in candidates {
+        let cleaned = root.replace('\\', "/");
+        let cleaned = cleaned.trim().trim_matches('/').to_string();
+        if cleaned.is_empty() || cleaned.contains("..") || cleaned.starts_with('/') {
+            continue;
+        }
+        // P0 allowlist: wiki + raw sources (and their subpaths).
+        let allowed = cleaned == "wiki"
+            || cleaned == "raw/sources"
+            || cleaned.starts_with("wiki/")
+            || cleaned.starts_with("raw/sources/");
+        if !allowed {
+            continue;
+        }
+        if !out.iter().any(|existing: &String| existing == &cleaned) {
+            out.push(cleaned);
+        }
+    }
+    if out.is_empty() {
+        out.push("wiki".to_string());
+    }
+    out
+}
+
+fn is_wiki_scan_root(root: &str) -> bool {
+    root == "wiki" || root.starts_with("wiki/")
+}
+
 pub async fn search_project_inner(
     project_path: String,
     query: String,
     top_k: usize,
     include_content: bool,
     query_embedding: Option<Vec<f32>>,
+    scan_roots: Option<Vec<String>>,
 ) -> Result<ProjectSearchResponse, String> {
     if query.trim().is_empty() {
         return Err("query is required".to_string());
@@ -342,10 +380,22 @@ pub async fn search_project_inner(
     let mut page_paths_by_stem = BTreeMap::new();
     let mut graph_pages = BTreeMap::new();
 
-    let wiki_root = Path::new(&project_path).join("wiki");
-    if wiki_root.exists() {
-        let mut searched_files = 0usize;
-        for entry in WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
+    let roots = normalize_scan_roots(scan_roots);
+    let include_wiki = roots.iter().any(|root| is_wiki_scan_root(root));
+    let mut searched_files = 0usize;
+    let mut hit_file_cap = false;
+
+    for root_rel in &roots {
+        if hit_file_cap {
+            break;
+        }
+        let scan_root = Path::new(&project_path).join(root_rel);
+        if !scan_root.exists() {
+            // Missing roots are skipped (no 500) so sources_only/hybrid stay resilient.
+            continue;
+        }
+        let root_is_wiki = is_wiki_scan_root(root_rel);
+        for entry in WalkDir::new(&scan_root).into_iter().filter_map(Result::ok) {
             let ext = entry.path().extension().and_then(|s| s.to_str());
             if !entry.file_type().is_file() || (ext != Some("md") && ext != Some("txt")) {
                 continue;
@@ -353,27 +403,28 @@ pub async fn search_project_inner(
             searched_files += 1;
             if searched_files > MAX_SEARCH_FILES {
                 eprintln!(
-                    "[Search] stopped scanning wiki after {MAX_SEARCH_FILES} markdown files in {project_path}"
+                    "[Search] stopped scanning after {MAX_SEARCH_FILES} markdown/text files in {project_path} (roots={roots:?})"
                 );
+                hit_file_cap = true;
                 break;
             }
             let content = match fs::read_to_string(entry.path()) {
                 Ok(content) => content,
                 Err(_) => continue,
             };
-            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                let previous = page_paths_by_stem.insert(
-                    stem.to_string(),
-                    relative_to_project(&project_path, entry.path()),
-                );
-                if let Some(previous) = previous {
-                    eprintln!(
-                        "[Search] duplicate wiki page stem '{stem}': '{previous}' and '{}' share one vector page_id",
-                        relative_to_project(&project_path, entry.path())
-                    );
+            let relative_path = relative_to_project(&project_path, entry.path());
+            // Vector store page_ids are wiki-stem based; only index wiki stems.
+            if root_is_wiki {
+                if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                    let previous = page_paths_by_stem
+                        .insert(stem.to_string(), relative_path.clone());
+                    if let Some(previous) = previous {
+                        eprintln!(
+                            "[Search] duplicate wiki page stem '{stem}': '{previous}' and '{relative_path}' share one vector page_id"
+                        );
+                    }
                 }
             }
-            let relative_path = relative_to_project(&project_path, entry.path());
             let title = extract_title(
                 &content,
                 entry
@@ -423,27 +474,30 @@ pub async fn search_project_inner(
     let mut vector_rank: BTreeMap<String, usize> = BTreeMap::new();
     let mut vector_score: BTreeMap<String, f32> = BTreeMap::new();
     let mut vector_hits = 0;
-    if let Some(embedding) = query_embedding {
-        if !embedding.is_empty() {
-            match search_by_embedding(&project_path, embedding, limit.max(10)).await {
-                Ok(vector_results) => {
-                    vector_hits = vector_results.len();
-                    for (idx, vr) in vector_results.iter().enumerate() {
-                        vector_rank.insert(vr.id.clone(), idx + 1);
-                        vector_score.insert(vr.id.clone(), vr.score);
+    // Vector index is wiki-page oriented; sources_only stays keyword-only (P0).
+    if include_wiki {
+        if let Some(embedding) = query_embedding {
+            if !embedding.is_empty() {
+                match search_by_embedding(&project_path, embedding, limit.max(10)).await {
+                    Ok(vector_results) => {
+                        vector_hits = vector_results.len();
+                        for (idx, vr) in vector_results.iter().enumerate() {
+                            vector_rank.insert(vr.id.clone(), idx + 1);
+                            vector_score.insert(vr.id.clone(), vr.score);
+                        }
+                        materialize_vector_only_results(
+                            &vector_results,
+                            &page_paths_by_stem,
+                            &project_path,
+                            &mut results,
+                            include_content,
+                        );
                     }
-                    materialize_vector_only_results(
-                        &vector_results,
-                        &page_paths_by_stem,
-                        &project_path,
-                        &mut results,
-                        include_content,
-                    );
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[Search] vector search failed; falling back to keyword results: {err}"
-                    );
+                    Err(err) => {
+                        eprintln!(
+                            "[Search] vector search failed; falling back to keyword results: {err}"
+                        );
+                    }
                 }
             }
         }
@@ -2026,6 +2080,7 @@ mod tests {
             20,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2061,6 +2116,7 @@ mod tests {
             "agent runtime".into(),
             10,
             false,
+            None,
             None,
         )
         .await
@@ -2181,6 +2237,7 @@ mod tests {
             20,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2210,6 +2267,7 @@ mod tests {
             20,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2217,6 +2275,105 @@ mod tests {
         assert_eq!(out.results[0].title, "Phrase");
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn normalize_scan_roots_defaults_and_filters() {
+        assert_eq!(normalize_scan_roots(None), vec!["wiki".to_string()]);
+        assert_eq!(
+            normalize_scan_roots(Some(vec![
+                "raw/sources".into(),
+                "../etc".into(),
+                "wiki".into(),
+                "wiki".into()
+            ])),
+            vec!["raw/sources".to_string(), "wiki".to_string()]
+        );
+        assert_eq!(
+            normalize_scan_roots(Some(vec!["secret".into()])),
+            vec!["wiki".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn sources_only_scans_raw_sources_not_wiki() {
+        let root = tmp_project();
+        write_page(
+            &root,
+            "wiki/concepts/wiki-only.md",
+            "---\ntitle: Wiki Only\n---\n\n# Wiki Only\n\nZZWIKIONLYMARKER body.",
+        );
+        write_page(
+            &root,
+            "raw/sources/source-doc.md",
+            "---\ntitle: Source Doc\n---\n\n# Source Doc\n\nZZSOURCEONLYMARKER body.",
+        );
+
+        let sources = search_project_inner(
+            root.to_string_lossy().to_string(),
+            "ZZSOURCEONLYMARKER".into(),
+            10,
+            true,
+            None,
+            Some(vec!["raw/sources".into()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sources.results.len(), 1);
+        assert!(sources.results[0].path.contains("raw/sources"));
+        assert_eq!(sources.results[0].title, "Source Doc");
+
+        let wiki_miss = search_project_inner(
+            root.to_string_lossy().to_string(),
+            "ZZWIKIONLYMARKER".into(),
+            10,
+            true,
+            None,
+            Some(vec!["raw/sources".into()]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            wiki_miss.results.is_empty(),
+            "sources_only must not return wiki hits: {:?}",
+            wiki_miss.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+
+        let hybrid = search_project_inner(
+            root.to_string_lossy().to_string(),
+            "ZZWIKIONLYMARKER".into(),
+            10,
+            true,
+            None,
+            Some(vec!["wiki".into(), "raw/sources".into()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hybrid.results.len(), 1);
+        assert!(hybrid.results[0].path.starts_with("wiki/"));
+
+        // Missing root should not error.
+        let empty_root = tmp_project();
+        write_page(
+            &empty_root,
+            "wiki/concepts/a.md",
+            "---\ntitle: A\n---\n\n# A\n\nhello",
+        );
+        let skip_missing = search_project_inner(
+            empty_root.to_string_lossy().to_string(),
+            "hello".into(),
+            10,
+            false,
+            None,
+            Some(vec!["raw/sources".into()]),
+        )
+        .await
+        .unwrap();
+        assert!(skip_missing.results.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(empty_root);
+    }
+
     #[test]
     fn parses_openai_batch_vectors_in_input_order() {
         let response = json!({
