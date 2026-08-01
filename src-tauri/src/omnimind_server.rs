@@ -738,6 +738,8 @@ fn handle_files(project_id: &str, query: &str) -> OmnimindResponse {
 #[serde(rename_all = "camelCase")]
 struct SearchRequest {
     query: String,
+    #[serde(default)]
+    mode: commands::search::SearchMode,
     top_k: Option<usize>,
     include_content: Option<bool>,
     query_embedding: Option<Vec<f32>>,
@@ -758,36 +760,54 @@ fn handle_search(project_id: &str, body: &str) -> OmnimindResponse {
 
     let top_k = req.top_k.unwrap_or(10).clamp(1, 50);
     let query = req.query;
+    let mode = req.mode;
 
-    let embedding_config = load_embedding_config();
-    let query_embedding = match tauri::async_runtime::block_on(
-        commands::search::resolve_query_embedding(&query, req.query_embedding, embedding_config),
-    ) {
-        Ok(embedding) => embedding,
-        Err(e) => return error_response(400, "EMBEDDING_ERROR", &e),
+    let query_embedding = if mode.uses_vector() {
+        let embedding_config = load_embedding_config();
+        match tauri::async_runtime::block_on(commands::search::resolve_query_embedding(
+            &query,
+            req.query_embedding,
+            embedding_config,
+        )) {
+            Ok(embedding) => embedding,
+            Err(e) => return error_response(400, "EMBEDDING_ERROR", &e),
+        }
+    } else {
+        None
     };
 
-    match tauri::async_runtime::block_on(commands::search::search_project_inner(
+    match tauri::async_runtime::block_on(commands::search::search_project_by_mode_inner(
         project.path.clone(),
         query,
         top_k,
         req.include_content.unwrap_or(false),
         query_embedding,
         None,
+        mode,
     )) {
         Ok(search) => OmnimindResponse {
             status: 200,
-            body: json!({
-                "ok": true,
-                "projectId": project.id,
-                "mode": search.mode,
-                "tokenHits": search.token_hits,
-                "vectorHits": search.vector_hits,
-                "results": search.results,
-            }),
+            body: search_response_body(&project.id, search),
         },
         Err(e) => error_response(500, "SEARCH_FAILED", &e),
     }
+}
+
+fn search_response_body(
+    project_id: &str,
+    search: commands::search::ProjectSearchResponse,
+) -> Value {
+    json!({
+        "ok": true,
+        "projectId": project_id,
+        "mode": search.mode,
+        "requestedMode": search.requested_mode,
+        "executedMode": search.executed_mode,
+        "tokenHits": search.token_hits,
+        "vectorHits": search.vector_hits,
+        "graphHits": search.graph_hits,
+        "results": search.results,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -919,6 +939,8 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
         Ok(res) => res,
         Err(_) => commands::search::ProjectSearchResponse {
             mode: "token".to_string(),
+            requested_mode: commands::search::SearchMode::Hybrid,
+            executed_mode: commands::search::SearchMode::Hybrid,
             results: Vec::new(),
             token_hits: 0,
             vector_hits: 0,
@@ -2099,7 +2121,10 @@ mod tests {
             snippet: String::new(),
             title_match: false,
             score,
+            bm25_score: Some(score),
             vector_score: None,
+            graph_score: None,
+            rrf_score: None,
             images: vec![],
             content: Some(format!("content for {title}")),
             graph_related_to: vec![],
@@ -2127,6 +2152,40 @@ mod tests {
         assert_eq!(parse_retrieval_mode(Some("hybrid")), RetrievalMode::Hybrid);
         assert_eq!(parse_retrieval_mode(Some("all")), RetrievalMode::Hybrid);
         assert_eq!(parse_retrieval_mode(Some("unknown")), RetrievalMode::Wiki);
+    }
+
+    #[test]
+    fn search_request_accepts_only_the_four_operator_modes() {
+        for mode in ["bm25", "vector", "graph", "hybrid"] {
+            let body = format!(r#"{{"query":"alpha","mode":"{mode}"}}"#);
+            assert!(serde_json::from_str::<SearchRequest>(&body).is_ok());
+        }
+        assert!(
+            serde_json::from_str::<SearchRequest>(r#"{"query":"alpha","mode":"semantic"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn search_response_body_uses_camel_case_mode_and_nullable_scores() {
+        let search = commands::search::ProjectSearchResponse {
+            mode: "bm25".to_string(),
+            requested_mode: commands::search::SearchMode::Bm25,
+            executed_mode: commands::search::SearchMode::Bm25,
+            results: vec![sample_result("wiki/result.md", "Result", 7.0)],
+            token_hits: 1,
+            vector_hits: 0,
+            graph_hits: 0,
+        };
+
+        let body = search_response_body("project-1", search);
+
+        assert_eq!(body["requestedMode"], "bm25");
+        assert_eq!(body["executedMode"], "bm25");
+        assert_eq!(body["results"][0]["bm25Score"], 7.0);
+        assert!(body["results"][0]["vectorScore"].is_null());
+        assert!(body["results"][0]["graphScore"].is_null());
+        assert!(body["results"][0]["rrfScore"].is_null());
     }
 
     #[test]

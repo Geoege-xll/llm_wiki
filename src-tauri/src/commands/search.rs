@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,6 +27,35 @@ const MIN_GRAPH_RESULT_RATIO: f64 = 0.15;
 const MAX_GRAPH_RESULT_RATIO: f64 = 0.30;
 const MAX_GRAPH_SEEDS: usize = 20;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    Bm25,
+    Vector,
+    Graph,
+    #[default]
+    Hybrid,
+}
+
+impl SearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bm25 => "bm25",
+            Self::Vector => "vector",
+            Self::Graph => "graph",
+            Self::Hybrid => "hybrid",
+        }
+    }
+
+    pub fn uses_vector(self) -> bool {
+        matches!(self, Self::Vector | Self::Hybrid)
+    }
+
+    fn uses_graph(self) -> bool {
+        matches!(self, Self::Graph | Self::Hybrid)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchImageRef {
@@ -40,12 +71,16 @@ pub struct ProjectSearchResult {
     pub snippet: String,
     pub title_match: bool,
     pub score: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bm25_score: Option<f64>,
     pub vector_score: Option<f32>,
+    pub graph_score: Option<f64>,
+    pub rrf_score: Option<f64>,
     pub images: Vec<SearchImageRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always present on the wire (including `[]`) for cross-language contract stability.
+    /// `default` keeps older payloads without the field deserializable.
+    #[serde(default)]
     pub graph_related_to: Vec<String>,
 }
 
@@ -53,6 +88,8 @@ pub struct ProjectSearchResult {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSearchResponse {
     pub mode: String,
+    pub requested_mode: SearchMode,
+    pub executed_mode: SearchMode,
     pub results: Vec<ProjectSearchResult>,
     pub token_hits: usize,
     pub vector_hits: usize,
@@ -108,17 +145,23 @@ pub async fn search_project(
     include_content: Option<bool>,
     query_embedding: Option<Vec<f32>>,
     embedding_config: Option<SearchEmbeddingConfig>,
+    mode: Option<SearchMode>,
 ) -> Result<ProjectSearchResponse, String> {
     run_guarded_async("search_project", async move {
-        let query_embedding =
-            resolve_query_embedding(&query, query_embedding, embedding_config).await?;
-        search_project_inner(
+        let mode = mode.unwrap_or_default();
+        let query_embedding = if mode.uses_vector() {
+            resolve_query_embedding(&query, query_embedding, embedding_config).await?
+        } else {
+            None
+        };
+        search_project_by_mode_inner(
             project_path,
             query,
             top_k.unwrap_or(DEFAULT_RESULTS),
             include_content.unwrap_or(false),
             query_embedding,
             None,
+            mode,
         )
         .await
     })
@@ -365,6 +408,81 @@ pub async fn search_project_inner(
     query_embedding: Option<Vec<f32>>,
     scan_roots: Option<Vec<String>>,
 ) -> Result<ProjectSearchResponse, String> {
+    let mut response = search_project_by_mode_inner(
+        project_path,
+        query,
+        top_k,
+        include_content,
+        query_embedding,
+        scan_roots,
+        SearchMode::Hybrid,
+    )
+    .await?;
+    match search_mode(
+        response.token_hits == 0,
+        response.vector_hits,
+        response.graph_hits,
+    ) {
+        "keyword" => {
+            response.results = rank_results_for_mode(
+                response.results,
+                SearchMode::Bm25,
+                top_k.clamp(1, MAX_RESULTS),
+            );
+            response.mode = "keyword".to_string();
+            response.executed_mode = SearchMode::Bm25;
+        }
+        "vector" => {
+            response.results = rank_results_for_mode(
+                response.results,
+                SearchMode::Vector,
+                top_k.clamp(1, MAX_RESULTS),
+            );
+            response.mode = "vector".to_string();
+            response.executed_mode = SearchMode::Vector;
+        }
+        _ => {}
+    }
+    Ok(response)
+}
+
+pub async fn search_project_by_mode_inner(
+    project_path: String,
+    query: String,
+    top_k: usize,
+    include_content: bool,
+    query_embedding: Option<Vec<f32>>,
+    scan_roots: Option<Vec<String>>,
+    mode: SearchMode,
+) -> Result<ProjectSearchResponse, String> {
+    search_project_by_mode_with_vector_search(
+        project_path,
+        query,
+        top_k,
+        include_content,
+        query_embedding,
+        scan_roots,
+        mode,
+        search_by_embedding_boxed,
+    )
+    .await
+}
+
+type VectorSearchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<PageVectorResult>, String>> + Send + 'a>>;
+type VectorSearchFn =
+    for<'a> fn(&'a str, Vec<f32>, usize) -> VectorSearchFuture<'a>;
+
+async fn search_project_by_mode_with_vector_search(
+    project_path: String,
+    query: String,
+    top_k: usize,
+    include_content: bool,
+    query_embedding: Option<Vec<f32>>,
+    scan_roots: Option<Vec<String>>,
+    mode: SearchMode,
+    vector_search: VectorSearchFn,
+) -> Result<ProjectSearchResponse, String> {
     if query.trim().is_empty() {
         return Err("query is required".to_string());
     }
@@ -471,58 +589,59 @@ pub async fn search_project_inner(
         token_rank.insert(normalize_path(&result.path), idx + 1);
     }
 
-    let mut vector_rank: BTreeMap<String, usize> = BTreeMap::new();
     let mut vector_score: BTreeMap<String, f32> = BTreeMap::new();
     let mut vector_hits = 0;
     // Vector index is wiki-page oriented; sources_only stays keyword-only (P0).
-    if include_wiki {
+    if mode.uses_vector() && include_wiki {
         if let Some(embedding) = query_embedding {
             if !embedding.is_empty() {
-                match search_by_embedding(&project_path, embedding, limit.max(10)).await {
-                    Ok(vector_results) => {
-                        vector_hits = vector_results.len();
-                        for (idx, vr) in vector_results.iter().enumerate() {
-                            vector_rank.insert(vr.id.clone(), idx + 1);
-                            vector_score.insert(vr.id.clone(), vr.score);
-                        }
-                        materialize_vector_only_results(
-                            &vector_results,
-                            &page_paths_by_stem,
-                            &project_path,
-                            &mut results,
-                            include_content,
-                        );
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "[Search] vector search failed; falling back to keyword results: {err}"
-                        );
-                    }
+                let vector_results = vector_search(&project_path, embedding, limit.max(10))
+                    .await
+                    .map_err(|err| format!("{} vector search failed: {err}", mode.as_str()))?;
+                vector_hits = vector_results.len();
+                for vr in &vector_results {
+                    vector_score.insert(vr.id.clone(), vr.score);
                 }
+                materialize_vector_only_results(
+                    &vector_results,
+                    &page_paths_by_stem,
+                    &project_path,
+                    &mut results,
+                    include_content,
+                );
             }
         }
     }
 
-    if vector_hits > 0 {
-        apply_rrf_scores(&mut results, &token_rank, &vector_rank, &vector_score);
+    for result in &mut results {
+        if let Some(score) = vector_score.get(&file_stem(&result.path)).copied() {
+            result.vector_score = Some(score);
+        }
     }
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    let graph_hits = blend_graph_results(
-        &mut results,
-        &graph_pages,
-        limit,
-        vector_hits,
-        include_content,
-    );
+    let graph_results = if mode.uses_graph() {
+        let seed_results = rank_results_for_mode(results.clone(), SearchMode::Hybrid, limit);
+        collect_graph_results(
+            &seed_results,
+            &graph_pages,
+            if mode == SearchMode::Graph {
+                limit
+            } else {
+                graph_result_quota(limit, vector_hits)
+            },
+            include_content,
+        )
+    } else {
+        Vec::new()
+    };
+    let graph_hits = graph_results.len();
+    merge_graph_results(&mut results, graph_results);
+    let results = rank_results_for_mode(results, mode, limit);
 
     Ok(ProjectSearchResponse {
-        mode: search_mode(token_rank.is_empty(), vector_hits, graph_hits).to_string(),
+        mode: mode.as_str().to_string(),
+        requested_mode: mode,
+        executed_mode: mode,
         token_hits: token_rank.len(),
         vector_hits,
         graph_hits,
@@ -530,27 +649,97 @@ pub async fn search_project_inner(
     })
 }
 
-fn apply_rrf_scores(
-    results: &mut [ProjectSearchResult],
-    token_rank: &BTreeMap<String, usize>,
-    vector_rank: &BTreeMap<String, usize>,
-    vector_score: &BTreeMap<String, f32>,
-) {
-    for result in results {
-        let token = token_rank.get(&normalize_path(&result.path)).copied();
-        let vector = vector_rank.get(&file_stem(&result.path)).copied();
-        let mut rrf = 0.0;
-        if let Some(rank) = token {
-            rrf += 1.0 / (RRF_K + rank as f64);
+fn rank_results_for_mode(
+    mut results: Vec<ProjectSearchResult>,
+    mode: SearchMode,
+    limit: usize,
+) -> Vec<ProjectSearchResult> {
+    match mode {
+        SearchMode::Bm25 => {
+            results.retain(|result| result.bm25_score.is_some());
+            for result in &mut results {
+                result.score = result.bm25_score.unwrap_or_default();
+                result.vector_score = None;
+                result.graph_score = None;
+                result.rrf_score = None;
+            }
         }
-        if let Some(rank) = vector {
-            rrf += 1.0 / (RRF_K + rank as f64);
+        SearchMode::Vector => {
+            results.retain(|result| result.vector_score.is_some());
+            for result in &mut results {
+                result.score = result.vector_score.unwrap_or_default() as f64;
+                result.bm25_score = None;
+                result.graph_score = None;
+                result.rrf_score = None;
+            }
         }
-        if let Some(score) = vector_score.get(&file_stem(&result.path)).copied() {
-            result.vector_score = Some(score);
+        SearchMode::Graph => {
+            results.retain(|result| result.graph_score.is_some());
+            for result in &mut results {
+                result.score = result.graph_score.unwrap_or_default();
+                result.bm25_score = None;
+                result.vector_score = None;
+                result.rrf_score = None;
+            }
         }
-        result.score = rrf;
+        SearchMode::Hybrid => {
+            let bm25_rank = score_rank(&results, |result| result.bm25_score);
+            let vector_rank = score_rank(&results, |result| {
+                result.vector_score.map(|score| score as f64)
+            });
+            let graph_rank = score_rank(&results, |result| result.graph_score);
+            results.retain(|result| {
+                result.bm25_score.is_some()
+                    || result.vector_score.is_some()
+                    || result.graph_score.is_some()
+            });
+            for result in &mut results {
+                let path = normalize_path(&result.path);
+                let mut rrf = 0.0;
+                for rank in [
+                    bm25_rank.get(&path),
+                    vector_rank.get(&path),
+                    graph_rank.get(&path),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    rrf += 1.0 / (RRF_K + *rank as f64);
+                }
+                result.score = rrf;
+                result.rrf_score = Some(rrf);
+            }
+        }
     }
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    results.truncate(limit);
+    results
+}
+
+fn score_rank(
+    results: &[ProjectSearchResult],
+    score: impl Fn(&ProjectSearchResult) -> Option<f64>,
+) -> BTreeMap<String, usize> {
+    let mut scored = results
+        .iter()
+        .filter_map(|result| score(result).map(|value| (result.path.clone(), value)))
+        .collect::<Vec<_>>();
+    scored.sort_by(|(path_a, score_a), (path_b, score_b)| {
+        score_b
+            .partial_cmp(score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| path_a.cmp(path_b))
+    });
+    scored
+        .into_iter()
+        .enumerate()
+        .map(|(index, (path, _))| (normalize_path(&path), index + 1))
+        .collect()
 }
 
 /// Reserve 15-30% of the final window for one-hop graph expansion. A full
@@ -567,16 +756,14 @@ fn graph_result_quota(limit: usize, vector_hits: usize) -> usize {
     ((limit as f64 * ratio).ceil() as usize).clamp(1, limit - 1)
 }
 
-fn blend_graph_results(
-    ranked_results: &mut Vec<ProjectSearchResult>,
+fn collect_graph_results(
+    ranked_results: &[ProjectSearchResult],
     pages: &BTreeMap<String, GraphPage>,
     limit: usize,
-    vector_hits: usize,
     include_content: bool,
-) -> usize {
+) -> Vec<ProjectSearchResult> {
     if ranked_results.is_empty() || pages.is_empty() {
-        ranked_results.truncate(limit);
-        return 0;
+        return Vec::new();
     }
 
     let mut aliases = BTreeMap::<String, String>::new();
@@ -646,40 +833,26 @@ fn blend_graph_results(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| path_a.cmp(path_b))
     });
-    candidates.truncate(graph_result_quota(limit, vector_hits));
+    candidates.truncate(limit);
     if candidates.is_empty() {
-        ranked_results.truncate(limit);
-        return 0;
+        return Vec::new();
     }
 
-    let selected_paths: BTreeSet<String> =
-        candidates.iter().map(|(path, _)| path.clone()).collect();
-    let mut existing = BTreeMap::<String, ProjectSearchResult>::new();
-    let mut ranked_paths = Vec::new();
-    for result in ranked_results.drain(..) {
-        let path = normalize_path(&result.path);
-        ranked_paths.push(path.clone());
-        existing.insert(path, result);
-    }
-
-    let graph_count = candidates.len();
-    let base_limit = limit.saturating_sub(graph_count);
-    let mut base_results: Vec<ProjectSearchResult> = ranked_paths
+    let existing = ranked_results
         .iter()
-        .filter(|path| !selected_paths.contains(*path))
-        .filter_map(|path| existing.get(path).cloned())
-        .take(base_limit)
-        .collect();
-
+        .map(|result| (normalize_path(&result.path), result.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut graph_results = Vec::new();
     for (path, graph_score) in candidates {
-        if let Some(result) = existing.remove(&path) {
-            let mut result = result;
+        if let Some(result) = existing.get(&path) {
+            let mut result = result.clone();
+            result.graph_score = Some(graph_score);
             result.graph_related_to = candidate_seeds
                 .remove(&path)
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
-            base_results.push(result);
+            graph_results.push(result);
             continue;
         }
         let Some(page) = pages.get(&path) else {
@@ -691,20 +864,43 @@ fn blend_graph_results(
             .into_iter()
             .collect::<Vec<_>>();
         let related = related_titles.join(", ");
-        base_results.push(ProjectSearchResult {
+        graph_results.push(ProjectSearchResult {
             path: page.path.clone(),
             title: page.title.clone(),
             snippet: format!("Graph neighbor of {related}"),
             title_match: false,
-            score: graph_score / (RRF_K + 1.0),
+            score: graph_score,
+            bm25_score: None,
             vector_score: None,
+            graph_score: Some(graph_score),
+            rrf_score: None,
             images: extract_image_refs(&page.content),
             content: include_content.then(|| page.content.clone()),
             graph_related_to: related_titles,
         });
     }
-    *ranked_results = base_results;
-    graph_count
+    graph_results
+}
+
+fn merge_graph_results(
+    results: &mut Vec<ProjectSearchResult>,
+    graph_results: Vec<ProjectSearchResult>,
+) {
+    let mut indexes = results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| (normalize_path(&result.path), index))
+        .collect::<BTreeMap<_, _>>();
+    for graph_result in graph_results {
+        let path = normalize_path(&graph_result.path);
+        if let Some(index) = indexes.get(&path).copied() {
+            results[index].graph_score = graph_result.graph_score;
+            results[index].graph_related_to = graph_result.graph_related_to;
+        } else {
+            indexes.insert(path, results.len());
+            results.push(graph_result);
+        }
+    }
 }
 
 fn normalize_graph_alias(value: &str) -> String {
@@ -808,6 +1004,18 @@ async fn search_by_embedding(
     Ok(ranked)
 }
 
+fn search_by_embedding_boxed<'a>(
+    project_path: &'a str,
+    query_embedding: Vec<f32>,
+    top_k: usize,
+) -> VectorSearchFuture<'a> {
+    Box::pin(search_by_embedding(
+        project_path,
+        query_embedding,
+        top_k,
+    ))
+}
+
 fn materialize_vector_only_results(
     vector_results: &[PageVectorResult],
     page_paths_by_stem: &BTreeMap<String, String>,
@@ -837,7 +1045,10 @@ fn materialize_vector_only_results(
                 snippet,
                 title_match: false,
                 score: 0.0,
+                bm25_score: None,
                 vector_score: Some(vr.score),
+                graph_score: None,
+                rrf_score: None,
                 images: extract_image_refs(&content),
                 content: include_content.then_some(content),
                 graph_related_to: Vec::new(),
@@ -924,7 +1135,10 @@ fn score_file(
         snippet: build_snippet(content, &snippet_anchor),
         title_match: title_token_score > 0 || title_has_phrase,
         score,
+        bm25_score: Some(score),
         vector_score: None,
+        graph_score: None,
+        rrf_score: None,
         images: extract_image_refs(content),
         content: include_content.then_some(content.to_string()),
         graph_related_to: Vec::new(),
@@ -1721,20 +1935,6 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
-    fn result(path: &str) -> ProjectSearchResult {
-        ProjectSearchResult {
-            path: path.to_string(),
-            title: path.to_string(),
-            snippet: String::new(),
-            title_match: false,
-            score: 0.0,
-            vector_score: None,
-            images: vec![],
-            content: None,
-            graph_related_to: Vec::new(),
-        }
-    }
-
     #[test]
     fn tokenizes_cjk_bigrams_and_chars() {
         let tokens = tokenize_query("默会知识");
@@ -1970,36 +2170,196 @@ mod tests {
     }
 
     #[test]
-    fn rrf_combines_token_and_vector_ranks_and_keeps_vector_score() {
-        let mut results = vec![
-            result("wiki/concepts/both.md"),
-            result("wiki/concepts/token-only.md"),
-            result("wiki/concepts/vector-only.md"),
-        ];
-        let token_rank = BTreeMap::from([
-            ("wiki/concepts/both.md".to_string(), 1),
-            ("wiki/concepts/token-only.md".to_string(), 2),
-        ]);
-        let vector_rank = BTreeMap::from([("both".to_string(), 1), ("vector-only".to_string(), 2)]);
-        let vector_score =
-            BTreeMap::from([("both".to_string(), 0.95), ("vector-only".to_string(), 0.8)]);
-
-        apply_rrf_scores(&mut results, &token_rank, &vector_rank, &vector_score);
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-
-        assert_eq!(results[0].path, "wiki/concepts/both.md");
-        assert!((results[0].score - (1.0 / 61.0 + 1.0 / 61.0)).abs() < 0.000001);
-        assert_eq!(results[0].vector_score, Some(0.95));
-        assert!((results[1].score - (1.0 / 62.0)).abs() < 0.000001);
-        assert!((results[2].score - (1.0 / 62.0)).abs() < 0.000001);
-    }
-
-    #[test]
     fn search_mode_distinguishes_keyword_vector_and_hybrid() {
         assert_eq!(search_mode(false, 0, 0), "keyword");
         assert_eq!(search_mode(true, 3, 0), "vector");
         assert_eq!(search_mode(false, 3, 0), "hybrid");
         assert_eq!(search_mode(false, 0, 1), "hybrid");
+    }
+
+    #[test]
+    fn explicit_search_modes_rank_by_their_native_score_only() {
+        let candidates = vec![
+            ProjectSearchResult {
+                path: "wiki/bm25.md".to_string(),
+                title: "BM25".to_string(),
+                snippet: String::new(),
+                title_match: true,
+                score: 0.0,
+                bm25_score: Some(9.0),
+                vector_score: Some(0.2),
+                graph_score: Some(0.4),
+                rrf_score: None,
+                images: vec![],
+                content: None,
+                graph_related_to: Vec::new(),
+            },
+            ProjectSearchResult {
+                path: "wiki/vector.md".to_string(),
+                title: "Vector".to_string(),
+                snippet: String::new(),
+                title_match: false,
+                score: 0.0,
+                bm25_score: Some(2.0),
+                vector_score: Some(0.9),
+                graph_score: Some(0.3),
+                rrf_score: None,
+                images: vec![],
+                content: None,
+                graph_related_to: Vec::new(),
+            },
+            ProjectSearchResult {
+                path: "wiki/graph.md".to_string(),
+                title: "Graph".to_string(),
+                snippet: String::new(),
+                title_match: false,
+                score: 0.0,
+                bm25_score: Some(1.0),
+                vector_score: Some(0.1),
+                graph_score: Some(0.8),
+                rrf_score: None,
+                images: vec![],
+                content: None,
+                graph_related_to: vec!["Seed".to_string()],
+            },
+        ];
+
+        let bm25 = rank_results_for_mode(candidates.clone(), SearchMode::Bm25, 10);
+        assert_eq!(bm25[0].path, "wiki/bm25.md");
+        assert_eq!(bm25[0].score, 9.0);
+        assert_eq!(bm25[0].vector_score, None);
+        assert_eq!(bm25[0].graph_score, None);
+        assert_eq!(bm25[0].rrf_score, None);
+
+        let vector = rank_results_for_mode(candidates.clone(), SearchMode::Vector, 10);
+        assert_eq!(vector[0].path, "wiki/vector.md");
+        assert!((vector[0].score - 0.9).abs() < 0.000001);
+        assert_eq!(vector[0].bm25_score, None);
+        assert_eq!(vector[0].graph_score, None);
+        assert_eq!(vector[0].rrf_score, None);
+
+        let graph = rank_results_for_mode(candidates, SearchMode::Graph, 10);
+        assert_eq!(graph[0].path, "wiki/graph.md");
+        assert_eq!(graph[0].score, 0.8);
+        assert_eq!(graph[0].bm25_score, None);
+        assert_eq!(graph[0].vector_score, None);
+        assert_eq!(graph[0].rrf_score, None);
+    }
+
+    #[test]
+    fn hybrid_mode_exposes_only_real_operator_scores_and_rrf() {
+        let candidates = vec![
+            ProjectSearchResult {
+                path: "wiki/both.md".to_string(),
+                title: "Both".to_string(),
+                snippet: String::new(),
+                title_match: true,
+                score: 0.0,
+                bm25_score: Some(4.0),
+                vector_score: Some(0.9),
+                graph_score: None,
+                rrf_score: None,
+                images: vec![],
+                content: None,
+                graph_related_to: Vec::new(),
+            },
+            ProjectSearchResult {
+                path: "wiki/bm25.md".to_string(),
+                title: "BM25".to_string(),
+                snippet: String::new(),
+                title_match: true,
+                score: 0.0,
+                bm25_score: Some(8.0),
+                vector_score: None,
+                graph_score: None,
+                rrf_score: None,
+                images: vec![],
+                content: None,
+                graph_related_to: Vec::new(),
+            },
+        ];
+
+        let hybrid = rank_results_for_mode(candidates, SearchMode::Hybrid, 10);
+        assert_eq!(hybrid[0].path, "wiki/both.md");
+        assert_eq!(hybrid[0].score, hybrid[0].rrf_score.unwrap());
+        assert_eq!(hybrid[1].vector_score, None);
+        assert_eq!(hybrid[1].graph_score, None);
+    }
+
+    #[test]
+    fn search_contract_serializes_camel_case_nullable_scores() {
+        let response = ProjectSearchResponse {
+            mode: "bm25".to_string(),
+            requested_mode: SearchMode::Bm25,
+            executed_mode: SearchMode::Bm25,
+            results: vec![ProjectSearchResult {
+                path: "wiki/result.md".to_string(),
+                title: "Result".to_string(),
+                snippet: "body".to_string(),
+                title_match: true,
+                score: 3.5,
+                bm25_score: Some(3.5),
+                vector_score: None,
+                graph_score: None,
+                rrf_score: None,
+                images: vec![],
+                content: None,
+                graph_related_to: Vec::new(),
+            }],
+            token_hits: 1,
+            vector_hits: 0,
+            graph_hits: 0,
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["requestedMode"], "bm25");
+        assert_eq!(value["executedMode"], "bm25");
+        assert_eq!(value["results"][0]["bm25Score"], 3.5);
+        assert!(value["results"][0]["vectorScore"].is_null());
+        assert!(value["results"][0]["graphScore"].is_null());
+        assert!(value["results"][0]["rrfScore"].is_null());
+        // Cross-language wire contract: graphRelatedTo is always present, even empty.
+        assert_eq!(
+            value["results"][0]["graphRelatedTo"],
+            serde_json::json!([])
+        );
+        assert!(value["results"][0].get("content").is_none());
+    }
+
+    #[test]
+    fn empty_graph_related_to_serializes_as_empty_array() {
+        let result = ProjectSearchResult {
+            path: "wiki/result.md".to_string(),
+            title: "Result".to_string(),
+            snippet: "body".to_string(),
+            title_match: false,
+            score: 1.0,
+            bm25_score: Some(1.0),
+            vector_score: None,
+            graph_score: None,
+            rrf_score: None,
+            images: vec![],
+            content: None,
+            graph_related_to: Vec::new(),
+        };
+
+        let value = serde_json::to_value(&result).unwrap();
+        assert!(
+            value.get("graphRelatedTo").is_some(),
+            "graphRelatedTo must always be present on the wire, got keys: {:?}",
+            value.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
+        assert_eq!(value["graphRelatedTo"], serde_json::json!([]));
+
+        let populated = ProjectSearchResult {
+            graph_related_to: vec!["Seed A".to_string(), "Seed B".to_string()],
+            ..result
+        };
+        let populated_value = serde_json::to_value(&populated).unwrap();
+        assert_eq!(
+            populated_value["graphRelatedTo"],
+            serde_json::json!(["Seed A", "Seed B"])
+        );
     }
 
     #[test]
@@ -2134,6 +2494,71 @@ mod tests {
                 && result.graph_related_to == vec!["Agent Runtime"]
         }));
         assert!(!out.results.iter().any(|result| result.title == "Unrelated"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn injected_vector_store_failure<'a>(
+        _project_path: &'a str,
+        _query_embedding: Vec<f32>,
+        _top_k: usize,
+    ) -> VectorSearchFuture<'a> {
+        Box::pin(async { Err("injected vector store failure".to_string()) })
+    }
+
+    #[tokio::test]
+    async fn explicit_vector_modes_propagate_vector_store_errors() {
+        let root = tmp_project();
+        write_page(
+            &root,
+            "wiki/concepts/agent.md",
+            "---\ntitle: Agent\n---\n\n# Agent\n\nagent details.",
+        );
+
+        for mode in [SearchMode::Vector, SearchMode::Hybrid] {
+            let error = search_project_by_mode_with_vector_search(
+                root.to_string_lossy().to_string(),
+                "agent".into(),
+                10,
+                false,
+                Some(vec![0.1, 0.2]),
+                None,
+                mode,
+                injected_vector_store_failure,
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error.contains("injected vector store failure"));
+            assert!(error.contains(mode.as_str()));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn non_vector_modes_do_not_call_vector_store() {
+        let root = tmp_project();
+        write_page(
+            &root,
+            "wiki/concepts/agent.md",
+            "---\ntitle: Agent\n---\n\n# Agent\n\nagent details.",
+        );
+
+        for mode in [SearchMode::Bm25, SearchMode::Graph] {
+            let response = search_project_by_mode_with_vector_search(
+                root.to_string_lossy().to_string(),
+                "agent".into(),
+                10,
+                false,
+                Some(vec![0.1, 0.2]),
+                None,
+                mode,
+                injected_vector_store_failure,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.executed_mode, mode);
+        }
         let _ = fs::remove_dir_all(root);
     }
 

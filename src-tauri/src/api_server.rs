@@ -1630,6 +1630,8 @@ fn write_raw_review_array(path: &Path, parsed: &Value) -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 struct SearchRequest {
     query: String,
+    #[serde(default)]
+    mode: commands::search::SearchMode,
     top_k: Option<usize>,
     include_content: Option<bool>,
     query_embedding: Option<Vec<f32>>,
@@ -1649,7 +1651,8 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
     }
     let top_k = req.top_k.unwrap_or(10).clamp(1, MAX_SEARCH_RESULTS);
     let query = req.query;
-    let query_embedding =
+    let mode = req.mode;
+    let query_embedding = if mode.uses_vector() {
         match tauri::async_runtime::block_on(commands::search::resolve_query_embedding(
             &query,
             req.query_embedding,
@@ -1657,20 +1660,26 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
         )) {
             Ok(embedding) => embedding,
             Err(e) => return err(400, e),
-        };
-    match tauri::async_runtime::block_on(commands::search::search_project_inner(
+        }
+    } else {
+        None
+    };
+    match tauri::async_runtime::block_on(commands::search::search_project_by_mode_inner(
         project.path.clone(),
         query,
         top_k,
         req.include_content.unwrap_or(false),
         query_embedding,
         None,
+        mode,
     )) {
         Ok(search) => ok(json!({
             "ok": true,
             "projectId": project.id,
             "mode": search.mode,
-            "note": "Search uses the shared backend hybrid retrieval service, combining keyword, vector, and one-hop knowledge-graph candidates. When embeddingConfig is enabled, the API automatically includes LanceDB vector results; clients may also pass queryEmbedding explicitly.",
+            "requestedMode": search.requested_mode,
+            "executedMode": search.executed_mode,
+            "note": "Search executes the requested Rust-native operator mode. Hybrid combines keyword, vector, and one-hop knowledge-graph candidates with RRF.",
             "tokenHits": search.token_hits,
             "vectorHits": search.vector_hits,
             "graphHits": search.graph_hits,
