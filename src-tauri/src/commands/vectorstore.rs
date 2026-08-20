@@ -3,9 +3,9 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use chrono::Duration;
-use lancedb::connect;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::table::{CompactionOptions, OptimizeAction};
+use lancedb::table::{AddDataMode, CompactionOptions, OptimizeAction};
+use lancedb::{connect, DistanceType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -42,6 +42,14 @@ pub struct ChunkUpsertInput {
     pub chunk_text: String,
     pub heading_path: String,
     pub embedding: Vec<f32>,
+}
+
+/// 全量替换索引时的页面 DTO。页面身份与分块向量均由受信任的编排层计算，
+/// Core 仍会逐项复验 page_id、维度与空载荷，禁止部分替换。
+#[derive(Debug, Deserialize)]
+pub struct PageChunkReplaceInput {
+    pub page_id: String,
+    pub chunks: Vec<ChunkUpsertInput>,
 }
 
 fn db_path(project_path: &str) -> String {
@@ -236,6 +244,10 @@ pub async fn vector_search(
         let results_stream = table
             .vector_search(query_embedding)
             .map_err(|e| format!("Search error: {e}"))?
+            // 嵌入模型表达的是向量方向上的语义相似度，向量模长不代表相关性。
+            // LanceDB 默认使用 L2；对于 Ollama 等未承诺单位归一化的向量，L2 会让
+            // 模长差异压过语义方向，因此这里显式使用余弦距离。
+            .distance_type(DistanceType::Cosine)
             .limit(top_k)
             .execute()
             .await
@@ -526,6 +538,87 @@ pub async fn vector_upsert_chunks(
     .await
 }
 
+/// 在 LanceDB 单次 Overwrite 提交中替换全部 v2 分块。
+///
+/// 与“先 drop/clear，再逐页 upsert”不同，Overwrite 只有在全部 RecordBatch 已验证并
+/// 成功写入后才产生新版本；中途失败时旧表仍可用。这是后台全量重建的原子切换边界。
+#[tauri::command]
+pub async fn vector_replace_all_chunks(
+    project_path: String,
+    pages: Vec<PageChunkReplaceInput>,
+) -> Result<(), String> {
+    run_guarded_async("vector_replace_all_chunks", async move {
+        let lock = vectorstore_v2_lock(&project_path);
+        let _guard = lock.write().await;
+
+        let first_chunk = pages
+            .iter()
+            .flat_map(|page| page.chunks.iter())
+            .next()
+            .ok_or_else(|| "Full vector replacement must contain at least one chunk".to_string())?;
+        let dim = first_chunk.embedding.len() as i32;
+        if dim == 0 {
+            return Err("Full vector replacement contains an empty embedding".to_string());
+        }
+
+        let schema = make_schema_v2(dim);
+        let mut seen_page_ids = std::collections::BTreeSet::new();
+        let mut batches = Vec::with_capacity(pages.len());
+        for page in &pages {
+            validate_page_id_for_v2(&page.page_id)?;
+            if page.chunks.is_empty() {
+                return Err(format!(
+                    "Full vector replacement page '{}' has no chunks",
+                    page.page_id
+                ));
+            }
+            if !seen_page_ids.insert(page.page_id.clone()) {
+                return Err(format!(
+                    "Full vector replacement contains duplicate page_id '{}'",
+                    page.page_id
+                ));
+            }
+            batches.push(make_batch_v2(
+                schema.clone(),
+                &page.page_id,
+                &page.chunks,
+                dim,
+            )?);
+        }
+
+        let db = connect(&db_path(&project_path))
+            .execute()
+            .await
+            .map_err(|e| format!("DB connect error: {e}"))?;
+        let tables = db
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| format!("List tables error: {e}"))?;
+
+        if tables.contains(&TABLE_V2.to_string()) {
+            let table = db
+                .open_table(TABLE_V2)
+                .execute()
+                .await
+                .map_err(|e| format!("Open table error: {e}"))?;
+            table
+                .add(batches)
+                .mode(AddDataMode::Overwrite)
+                .execute()
+                .await
+                .map_err(|e| format!("Atomic vector replacement failed: {e}"))?;
+        } else {
+            db.create_table(TABLE_V2, batches)
+                .execute()
+                .await
+                .map_err(|e| format!("Create table error: {e}"))?;
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Top-K chunk search. Returns every matching chunk's metadata + score
 /// (1 / (1 + distance), matching v1's convention for drop-in replacement
 /// at the TS layer). TS is responsible for grouping by page_id.
@@ -563,6 +656,9 @@ pub async fn vector_search_chunks(
         let results_stream = table
             .vector_search(query_embedding)
             .map_err(|e| format!("Search error: {e}"))?
+            // v2 是当前生产索引。与旧表保持同一余弦语义，避免未归一化向量在
+            // 默认 L2 距离下出现“数值接近但语义无关”的错误排序。
+            .distance_type(DistanceType::Cosine)
             .limit(top_k)
             .execute()
             .await
@@ -1038,6 +1134,76 @@ mod tests_v2 {
     }
 
     #[tokio::test]
+    async fn v2_full_replace_is_single_validated_overwrite() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+
+        vector_upsert_chunks(
+            pp.clone(),
+            "old-page".into(),
+            make_chunks("old-page", 3, 16),
+        )
+        .await
+        .unwrap();
+
+        vector_replace_all_chunks(
+            pp.clone(),
+            vec![
+                PageChunkReplaceInput {
+                    page_id: "new-a".into(),
+                    chunks: make_chunks("new-a", 2, 16),
+                },
+                PageChunkReplaceInput {
+                    page_id: "new-b".into(),
+                    chunks: make_chunks("new-b", 1, 16),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(vector_count_chunks(pp.clone()).await.unwrap(), 3);
+        let results = vector_search_chunks(pp, fake_embedding(0, 16), 10)
+            .await
+            .unwrap();
+        assert!(results.iter().all(|result| result.page_id != "old-page"));
+        assert!(results.iter().any(|result| result.page_id == "new-a"));
+        assert!(results.iter().any(|result| result.page_id == "new-b"));
+    }
+
+    #[tokio::test]
+    async fn v2_invalid_full_replace_preserves_existing_table() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+        vector_upsert_chunks(
+            pp.clone(),
+            "old-page".into(),
+            make_chunks("old-page", 3, 16),
+        )
+        .await
+        .unwrap();
+
+        let error = vector_replace_all_chunks(
+            pp.clone(),
+            vec![
+                PageChunkReplaceInput {
+                    page_id: "duplicate".into(),
+                    chunks: make_chunks("duplicate", 1, 16),
+                },
+                PageChunkReplaceInput {
+                    page_id: "duplicate".into(),
+                    chunks: make_chunks("duplicate", 1, 16),
+                },
+            ],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("duplicate page_id"));
+        assert_eq!(vector_count_chunks(pp).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
     async fn v2_delete_page_removes_only_its_chunks() {
         let p = tmp_project();
         let pp = p.to_string_lossy().to_string();
@@ -1075,6 +1241,44 @@ mod tests_v2 {
             assert!(r.chunk_text.contains("chunk"));
             assert!(r.heading_path.starts_with("## Heading"));
         }
+    }
+
+    #[tokio::test]
+    async fn v2_search_uses_cosine_direction_instead_of_vector_magnitude() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+
+        // page-a 与查询方向完全一致，但模长相差 100 倍；page-b 模长更接近，
+        // 方向却偏离 45 度。默认 L2 会错误偏向 page-b，余弦距离应稳定选择 page-a。
+        vector_upsert_chunks(
+            pp.clone(),
+            "page-a".into(),
+            vec![ChunkUpsertInput {
+                chunk_index: 0,
+                chunk_text: "同方向高模长向量".into(),
+                heading_path: "## 语义方向".into(),
+                embedding: vec![100.0, 0.0],
+            }],
+        )
+        .await
+        .unwrap();
+        vector_upsert_chunks(
+            pp.clone(),
+            "page-b".into(),
+            vec![ChunkUpsertInput {
+                chunk_index: 0,
+                chunk_text: "模长接近但方向偏离".into(),
+                heading_path: "## 模长干扰".into(),
+                embedding: vec![1.0, 1.0],
+            }],
+        )
+        .await
+        .unwrap();
+
+        let results = vector_search_chunks(pp, vec![1.0, 0.0], 2).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].page_id, "page-a");
+        assert!(results[0].score > results[1].score);
     }
 
     #[tokio::test]

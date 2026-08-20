@@ -14,6 +14,14 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:19829";
 const SERVICE_NAME: &str = "OmniMind-Wiki-Core";
 const SERVER_MODE: &str = "server-only";
 const DEFAULT_MAX_CONTEXT_SIZE: usize = 204_800;
+/// chat-context 接受的绝对字符预算上限（1 MiB 字符）。
+/// 该值保留上游 204_800 默认预算并覆盖 Python 自动客服当前 40_000 请求，
+/// 同时阻止恶意极值把百分比计算或候选装箱放大到不可控范围。
+const MAX_CHAT_CONTEXT_SIZE: usize = 1_048_576;
+/// chat-context 的历史默认候选数。保持既有固定值 10，避免未传新字段的调用方行为漂移。
+const DEFAULT_CHAT_CONTEXT_TOP_K: usize = 10;
+/// 与 Rust 原生搜索的公开上限一致，防止服务端上下文接口被异常大候选数拖垮。
+const MAX_CHAT_CONTEXT_TOP_K: usize = 50;
 const APP_STATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Hybrid retrieval keeps at least this many `raw/sources` hits when available.
 const HYBRID_SOURCES_FLOOR: usize = 2;
@@ -34,12 +42,25 @@ struct ChatHistoryMessage {
 #[derive(Debug, Deserialize)]
 struct ChatContextRequest {
     query: String,
+    /// 可选的调用方显式查询向量。
+    ///
+    /// OmniMind 的租户级 Embedding 配置保存在 Python 服务中，不能写入 Wiki Core
+    /// 的全局 app-state，也不能把租户密钥下发给 Core。因此 server-only 模式允许
+    /// Python 先完成向量化，再把向量交给 Core 原生 LanceDB/BM25/Graph/RRF 检索。
+    #[serde(default)]
+    query_embedding: Option<Vec<f32>>,
     #[serde(default)]
     history: Vec<ChatHistoryMessage>,
     #[serde(default)]
     max_history_messages: Option<usize>,
     #[serde(default)]
     max_context_size: Option<usize>,
+    /// 可选的 Rust 原生候选数量；缺省继续使用既有的 10。
+    #[serde(default)]
+    top_k: Option<usize>,
+    /// 可选的单块正文字符上限。仅显式提供时启用“截取当前块后继续装箱”的新行为。
+    #[serde(default)]
+    max_block_chars: Option<usize>,
     #[serde(default)]
     output_language: Option<String>,
     #[serde(default)]
@@ -59,7 +80,10 @@ enum RetrievalMode {
 }
 
 fn parse_retrieval_mode(raw: Option<&str>) -> RetrievalMode {
-    match raw.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+    match raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
         None | Some("") | Some("wiki") => RetrievalMode::Wiki,
         Some("sources_only") | Some("faithful") | Some("sources") => RetrievalMode::SourcesOnly,
         Some("hybrid") | Some("all") => RetrievalMode::Hybrid,
@@ -315,11 +339,7 @@ fn handle_extract_images(project_id: &str, body: &str) -> OmnimindResponse {
     };
 
     if req.source_path.trim().is_empty() {
-        return error_response(
-            400,
-            "SOURCE_PATH_REQUIRED",
-            "sourcePath must not be empty",
-        );
+        return error_response(400, "SOURCE_PATH_REQUIRED", "sourcePath must not be empty");
     }
 
     let project = match resolve_project(project_id) {
@@ -449,6 +469,9 @@ fn handle_get(path: &str) -> OmnimindResponse {
             match parts.as_slice() {
                 ["api", "v1", "projects", project_id, "files"] => handle_files(project_id, query),
                 ["api", "v1", "projects", project_id, "graph"] => handle_graph(project_id, query),
+                ["api", "v1", "projects", project_id, "vector-index"] => {
+                    handle_vector_index_status(project_id)
+                }
                 _ => error_response(404, "NOT_FOUND", "Not found"),
             }
         }
@@ -489,9 +512,19 @@ fn handle_post(path: &str, request: &mut tiny_http::Request) -> OmnimindResponse
             let body = read_request_body(request).unwrap_or_default();
             handle_vector_upsert_chunks(project_id, &body)
         }
+        ["api", "v1", "projects", project_id, "vector-replace"] => {
+            let body = read_request_body(request).unwrap_or_default();
+            handle_vector_replace_all_chunks(project_id, &body)
+        }
         ["api", "v1", "projects", project_id, "vector-delete"] => {
             let body = read_request_body(request).unwrap_or_default();
             handle_vector_delete_page(project_id, &body)
+        }
+        ["api", "v1", "projects", project_id, "vector-clear"] => {
+            handle_vector_clear_chunks(project_id)
+        }
+        ["api", "v1", "projects", project_id, "vector-optimize"] => {
+            handle_vector_optimize_chunks(project_id)
         }
         ["api", "v1", "projects", project_id, "extract-images"] => {
             let body = read_request_body(request).unwrap_or_default();
@@ -828,11 +861,15 @@ struct ApiGraphEdge {
     weight: f64,
 }
 
-
 #[derive(Deserialize)]
 struct VectorUpsertRequest {
     page_id: String,
     chunks: Vec<commands::vectorstore::ChunkUpsertInput>,
+}
+
+#[derive(Deserialize)]
+struct VectorReplaceRequest {
+    pages: Vec<commands::vectorstore::PageChunkReplaceInput>,
 }
 
 fn handle_vector_upsert_chunks(project_id: &str, body: &str) -> OmnimindResponse {
@@ -856,6 +893,34 @@ fn handle_vector_upsert_chunks(project_id: &str, body: &str) -> OmnimindResponse
             body: json!({ "ok": true, "message": "Vector chunks successfully upserted" }),
         },
         Err(e) => error_response(500, "VECTOR_UPSERT_FAILED", &e),
+    }
+}
+
+/// 把后台预计算完成的全部页面向量作为一个 LanceDB 版本原子替换。
+/// 解析、项目解析或 Core 写入失败时都不回显向量、正文或内部文件路径。
+fn handle_vector_replace_all_chunks(project_id: &str, body: &str) -> OmnimindResponse {
+    let request: VectorReplaceRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(_) => return error_response(400, "INVALID_VECTOR_REPLACE", "Invalid vector payload"),
+    };
+    let project = match resolve_project(project_id) {
+        Ok(project) => project,
+        Err(e) => return error_response(404, "PROJECT_NOT_FOUND", &e),
+    };
+
+    match tauri::async_runtime::block_on(commands::vectorstore::vector_replace_all_chunks(
+        project.path.clone(),
+        request.pages,
+    )) {
+        Ok(()) => OmnimindResponse {
+            status: 200,
+            body: json!({ "ok": true, "project_id": project_id }),
+        },
+        Err(_) => error_response(
+            500,
+            "VECTOR_INDEX_REPLACE_FAILED",
+            "Unable to replace vector index",
+        ),
     }
 }
 
@@ -887,6 +952,78 @@ fn handle_vector_delete_page(project_id: &str, body: &str) -> OmnimindResponse {
     }
 }
 
+/// 返回 Core 原生分块向量索引的当前行数。
+///
+/// 该接口只暴露索引统计，不返回任何向量或知识正文，供 Python 的持久重建状态机
+/// 做完成校验；索引数据仍完全由 Wiki Core/LanceDB 管理。
+fn handle_vector_index_status(project_id: &str) -> OmnimindResponse {
+    let project = match resolve_project(project_id) {
+        Ok(project) => project,
+        Err(e) => return error_response(404, "PROJECT_NOT_FOUND", &e),
+    };
+
+    match tauri::async_runtime::block_on(commands::vectorstore::vector_count_chunks(
+        project.path.clone(),
+    )) {
+        Ok(chunk_count) => OmnimindResponse {
+            status: 200,
+            body: json!({ "ok": true, "project_id": project_id, "chunk_count": chunk_count }),
+        },
+        Err(_) => error_response(
+            500,
+            "VECTOR_INDEX_STATUS_FAILED",
+            "Unable to read vector index status",
+        ),
+    }
+}
+
+/// 清空 Core 原生分块索引。
+///
+/// Python 重建器必须先把全部页面切块和向量化成功，才会调用本接口；这样 Embedding
+/// Provider 暂时失败时不会提前破坏仍可用的旧索引。
+fn handle_vector_clear_chunks(project_id: &str) -> OmnimindResponse {
+    let project = match resolve_project(project_id) {
+        Ok(project) => project,
+        Err(e) => return error_response(404, "PROJECT_NOT_FOUND", &e),
+    };
+
+    match tauri::async_runtime::block_on(commands::vectorstore::vector_clear_chunks(
+        project.path.clone(),
+    )) {
+        Ok(()) => OmnimindResponse {
+            status: 200,
+            body: json!({ "ok": true, "project_id": project_id }),
+        },
+        Err(_) => error_response(
+            500,
+            "VECTOR_INDEX_CLEAR_FAILED",
+            "Unable to clear vector index",
+        ),
+    }
+}
+
+/// 对 Core 原生 LanceDB 分块表执行优化。
+fn handle_vector_optimize_chunks(project_id: &str) -> OmnimindResponse {
+    let project = match resolve_project(project_id) {
+        Ok(project) => project,
+        Err(e) => return error_response(404, "PROJECT_NOT_FOUND", &e),
+    };
+
+    match tauri::async_runtime::block_on(commands::vectorstore::vector_optimize_chunks(
+        project.path.clone(),
+    )) {
+        Ok(()) => OmnimindResponse {
+            status: 200,
+            body: json!({ "ok": true, "project_id": project_id }),
+        },
+        Err(_) => error_response(
+            500,
+            "VECTOR_INDEX_OPTIMIZE_FAILED",
+            "Unable to optimize vector index",
+        ),
+    }
+}
+
 fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
     let project = match resolve_project(project_id) {
         Ok(project) => project,
@@ -906,8 +1043,21 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
     if request.query.trim().is_empty() {
         return error_response(400, "INVALID_QUERY", "query must not be empty");
     }
+    if request.max_block_chars == Some(0) {
+        return error_response(
+            400,
+            "INVALID_MAX_BLOCK_CHARS",
+            "max_block_chars must be greater than zero",
+        );
+    }
 
     let budget = compute_context_budget(request.max_context_size);
+    let effective_max_block_chars =
+        compute_effective_max_block_chars(request.max_block_chars, &budget);
+    let top_k = request
+        .top_k
+        .unwrap_or(DEFAULT_CHAT_CONTEXT_TOP_K)
+        .clamp(1, MAX_CHAT_CONTEXT_TOP_K);
     let retrieval_mode = parse_retrieval_mode(request.retrieval_mode.as_deref());
     let scan_roots = scan_roots_for_mode(retrieval_mode);
     let mode_label = retrieval_mode_label(retrieval_mode);
@@ -918,38 +1068,31 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
     let query_embedding = if matches!(retrieval_mode, RetrievalMode::SourcesOnly) {
         None
     } else {
-        match tauri::async_runtime::block_on(commands::search::resolve_query_embedding(
+        match tauri::async_runtime::block_on(commands::search::resolve_query_embedding_strict(
             &request.query,
-            None,
+            request.query_embedding.clone(),
             embedding_config,
         )) {
             Ok(embedding) => embedding,
-            Err(_) => None,
+            Err(error) => return retrieval_failed_response(&error),
         }
     };
 
     let search = match tauri::async_runtime::block_on(commands::search::search_project_inner(
         project.path.clone(),
         request.query.clone(),
-        10,   // top_k for context
+        top_k,
         true, // include_content
         query_embedding,
         Some(scan_roots.clone()),
     )) {
         Ok(res) => res,
-        Err(_) => commands::search::ProjectSearchResponse {
-            mode: "token".to_string(),
-            requested_mode: commands::search::SearchMode::Hybrid,
-            executed_mode: commands::search::SearchMode::Hybrid,
-            results: Vec::new(),
-            token_hits: 0,
-            vector_hits: 0,
-            graph_hits: 0,
-        },
+        Err(error) => return retrieval_failed_response(&error),
     };
 
     let ordered = order_results_for_context(retrieval_mode, search.results);
-    let (context_blocks, references) = assemble_context_blocks(ordered, &budget);
+    let (context_blocks, references) =
+        assemble_context_blocks(ordered, &budget, effective_max_block_chars);
 
     let status = if context_blocks.is_empty() {
         "EMPTY_CONTEXT"
@@ -972,12 +1115,14 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
                 "index_budget": budget.index_budget,
                 "page_budget": budget.page_budget,
                 "max_page_size": budget.max_page_size,
+                "max_block_chars": effective_max_block_chars,
             },
             "retrieval_debug": build_retrieval_debug(
                 &request,
                 mode_label,
                 &scan_roots,
                 context_blocks.len(),
+                effective_max_block_chars,
                 Some(RetrievalSearchStats {
                     search_mode: search.mode.as_str(),
                     vector_hits: search.vector_hits,
@@ -1039,49 +1184,103 @@ fn order_results_for_context(
 fn assemble_context_blocks(
     ordered: Vec<commands::search::ProjectSearchResult>,
     budget: &ContextBudget,
+    max_block_chars: Option<usize>,
 ) -> (Vec<Value>, Vec<Value>) {
     let mut context_blocks = Vec::new();
     let mut references = Vec::new();
     let mut current_size = 0;
 
-    for (idx, res) in ordered.into_iter().enumerate() {
-        let ref_id = idx + 1;
-        let content = res.content.unwrap_or_default();
-        let block = format!("[{}] {}\n{}", ref_id, res.title, content);
-        let block_size = block.chars().count();
+    for res in ordered {
+        // id 必须按最终实际装入顺序连续生成；否则被预算跳过的候选会留下不可引用的空洞。
+        let ref_id = context_blocks.len().saturating_add(1);
+        let content = res.content.clone().unwrap_or_default();
+        let header = format!("[{}] {}\n", ref_id, res.title);
+        let header_size = header.chars().count();
 
-        if current_size + block_size > budget.page_budget {
-            // Truncate if single block is too large or we exceeded budget
+        if let Some(per_block_cap) = max_block_chars {
+            // 显式单块上限是 OmniMind 的模型预算扩展：每个宽泛页面最多消耗固定正文预算，
+            // 截取后仍继续尝试后排候选，避免第一篇产品总览独占全部上下文。
+            let remaining = budget.page_budget.saturating_sub(current_size);
+            if remaining <= header_size {
+                break;
+            }
+            let content_cap = per_block_cap.min(remaining.saturating_sub(header_size));
+            let truncated_content: String = content.chars().take(content_cap).collect();
+            let block_size = header_size.saturating_add(truncated_content.chars().count());
+            push_context_result(
+                &mut context_blocks,
+                &mut references,
+                ref_id,
+                &res,
+                truncated_content,
+            );
+            current_size = current_size.saturating_add(block_size);
+            continue;
+        }
+
+        // 未提供新字段时保留上游既有装箱语义：完整页优先；首块过大时按原预算截断后结束。
+        let block_size = header_size.saturating_add(content.chars().count());
+
+        if current_size.saturating_add(block_size) > budget.page_budget {
             if current_size == 0 {
-                let truncated: String = block.chars().take(budget.max_page_size).collect();
-                context_blocks.push(json!({
-                    "id": ref_id,
-                    "title": res.title,
-                    "content": truncated,
-                }));
-                references.push(json!({
-                    "id": ref_id,
-                    "title": res.title,
-                    "path": res.path,
-                }));
+                // 避免先拼出可能很大的完整 block 再截断；直接按字符链收集受控前缀。
+                let truncated: String = header
+                    .chars()
+                    .chain(content.chars())
+                    .take(budget.max_page_size)
+                    .collect();
+                push_context_result(
+                    &mut context_blocks,
+                    &mut references,
+                    ref_id,
+                    &res,
+                    truncated,
+                );
             }
             break;
         }
 
-        context_blocks.push(json!({
-            "id": ref_id,
-            "title": res.title,
-            "content": content,
-        }));
-        references.push(json!({
-            "id": ref_id,
-            "title": res.title,
-            "path": res.path,
-        }));
-        current_size += block_size;
+        push_context_result(&mut context_blocks, &mut references, ref_id, &res, content);
+        current_size = current_size.saturating_add(block_size);
     }
 
     (context_blocks, references)
+}
+
+/// 将 Rust 原生检索证据无损投影到 chat-context 契约。
+/// Python 只能消费这些候选并按最终模型预算裁剪，不能重新读取图谱来伪造来源或分数。
+fn push_context_result(
+    context_blocks: &mut Vec<Value>,
+    references: &mut Vec<Value>,
+    ref_id: usize,
+    result: &commands::search::ProjectSearchResult,
+    content: String,
+) {
+    let score_fields = json!({
+        "score": result.score,
+        "bm25Score": result.bm25_score,
+        "vectorScore": result.vector_score,
+        "graphScore": result.graph_score,
+        "rrfScore": result.rrf_score,
+        "graphRelatedTo": result.graph_related_to,
+    });
+
+    let mut block = score_fields.clone();
+    if let Some(object) = block.as_object_mut() {
+        object.insert("id".into(), json!(ref_id));
+        object.insert("title".into(), json!(result.title));
+        object.insert("path".into(), json!(result.path));
+        object.insert("content".into(), json!(content));
+    }
+    context_blocks.push(block);
+
+    let mut reference = score_fields;
+    if let Some(object) = reference.as_object_mut() {
+        object.insert("id".into(), json!(ref_id));
+        object.insert("title".into(), json!(result.title));
+        object.insert("path".into(), json!(result.path));
+    }
+    references.push(reference);
 }
 
 struct RetrievalSearchStats<'a> {
@@ -1094,11 +1293,13 @@ struct RetrievalSearchStats<'a> {
 fn compute_context_budget(max_context_size: Option<usize>) -> ContextBudget {
     let max_ctx = max_context_size
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MAX_CONTEXT_SIZE);
-    let response_reserve = max_ctx * 15 / 100;
-    let index_budget = max_ctx * 5 / 100;
-    let page_budget = max_ctx * 50 / 100;
-    let max_page_size = page_budget.min(5_000.max(page_budget * 30 / 100));
+        .unwrap_or(DEFAULT_MAX_CONTEXT_SIZE)
+        .min(MAX_CHAT_CONTEXT_SIZE);
+    // 即使未来上限调整，也使用饱和乘法，避免百分比预算在 usize 边界回绕。
+    let response_reserve = max_ctx.saturating_mul(15) / 100;
+    let index_budget = max_ctx.saturating_mul(5) / 100;
+    let page_budget = max_ctx.saturating_mul(50) / 100;
+    let max_page_size = page_budget.min(5_000.max(page_budget.saturating_mul(30) / 100));
 
     ContextBudget {
         max_ctx,
@@ -1109,11 +1310,21 @@ fn compute_context_budget(max_context_size: Option<usize>) -> ContextBudget {
     }
 }
 
+/// 单块预算永远不能超过已经夹紧的总页面预算。
+/// 保留 `None` 用于区分旧默认装箱语义与调用方显式启用的逐块截取语义。
+fn compute_effective_max_block_chars(
+    requested: Option<usize>,
+    budget: &ContextBudget,
+) -> Option<usize> {
+    requested.map(|value| value.min(budget.page_budget))
+}
+
 fn build_retrieval_debug(
     request: &ChatContextRequest,
     retrieval_mode: &str,
     scan_roots: &[String],
     result_count: usize,
+    effective_max_block_chars: Option<usize>,
     search_stats: Option<RetrievalSearchStats<'_>>,
 ) -> Value {
     // Always surface retrieval_mode for ops; expand when include_debug=true.
@@ -1130,7 +1341,12 @@ fn build_retrieval_debug(
         "include_debug": true,
         "mode": "server-only",
         "history_message_count": request.history.len(),
-        "history_content_chars": request.history.iter().map(|item| item.content.chars().count()).sum::<usize>(),
+        "history_content_chars": request.history.iter().fold(0usize, |total, item| total.saturating_add(item.content.chars().count())),
+        "requested_top_k": request.top_k.unwrap_or(DEFAULT_CHAT_CONTEXT_TOP_K).clamp(1, MAX_CHAT_CONTEXT_TOP_K),
+        "requested_max_context_size": request.max_context_size,
+        "effective_max_context_size": compute_context_budget(request.max_context_size).max_ctx,
+        "requested_max_block_chars": request.max_block_chars,
+        "effective_max_block_chars": effective_max_block_chars,
     });
 
     if let Some(stats) = search_stats {
@@ -1143,6 +1359,13 @@ fn build_retrieval_debug(
     }
 
     debug
+}
+
+/// 检索失败与真实空召回必须使用不同的稳定信封。
+/// 内部错误只写入服务端 stderr，响应不回显文件内容、绝对路径或 Provider 原始异常。
+fn retrieval_failed_response(internal_error: &str) -> OmnimindResponse {
+    eprintln!("[OmniMind Server] chat-context retrieval failed: {internal_error}");
+    error_response(502, "RETRIEVAL_FAILED", "Knowledge retrieval failed")
 }
 
 fn error_response(status: u16, code: &str, message: &str) -> OmnimindResponse {
@@ -1647,9 +1870,7 @@ struct ExtractTextRequest {
 }
 
 fn normalize_extract_extension(raw: &str) -> String {
-    raw.trim()
-        .trim_start_matches('.')
-        .to_lowercase()
+    raw.trim().trim_start_matches('.').to_lowercase()
 }
 
 fn is_extract_text_allowed_ext(extension: &str) -> bool {
@@ -1674,7 +1895,10 @@ fn content_bytes_within_limit(decoded_len: usize) -> Result<(), String> {
 
 fn sanitize_memory_filename(filename: Option<&str>, extension: &str) -> String {
     let fallback = format!("upload.{extension}");
-    let raw = filename.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("");
+    let raw = filename
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
     if raw.is_empty() {
         return fallback;
     }
@@ -1895,7 +2119,6 @@ fn handle_extract_text_from_path(req: &ExtractTextRequest) -> OmnimindResponse {
     }
 }
 
-
 fn handle_graph(project_id: &str, query: &str) -> OmnimindResponse {
     let project = match resolve_project(project_id) {
         Ok(project) => project,
@@ -1928,14 +2151,15 @@ fn handle_graph(project_id: &str, query: &str) -> OmnimindResponse {
                     .then_with(|| a.id.cmp(&b.id))
             });
             nodes.truncate(limit);
-            let ids: std::collections::BTreeSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
+            let ids: std::collections::BTreeSet<String> =
+                nodes.iter().map(|n| n.id.clone()).collect();
             let edges: Vec<ApiGraphEdge> = edges
                 .into_iter()
                 .filter(|e| ids.contains(&e.source) && ids.contains(&e.target))
                 .collect();
             OmnimindResponse {
                 status: 200,
-                body: json!({ "ok": true, "projectId": project.id, "nodes": nodes, "edges": edges })
+                body: json!({ "ok": true, "projectId": project.id, "nodes": nodes, "edges": edges }),
             }
         }
         Err(e) => error_response(500, "GRAPH_BUILD_FAILED", &e),
@@ -1945,7 +2169,10 @@ fn handle_graph(project_id: &str, query: &str) -> OmnimindResponse {
 fn build_graph(project_path: &str) -> Result<(Vec<ApiGraphNode>, Vec<ApiGraphEdge>), String> {
     let wiki_root = Path::new(project_path).join("wiki");
     let mut raw: BTreeMap<String, (String, String, String, Vec<String>)> = BTreeMap::new();
-    for entry in walkdir::WalkDir::new(&wiki_root).into_iter().filter_map(Result::ok) {
+    for entry in walkdir::WalkDir::new(&wiki_root)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|s| s.to_str()) != Some("md")
         {
@@ -2205,15 +2432,24 @@ mod tests {
     fn retrieval_debug_always_includes_mode() {
         let request = ChatContextRequest {
             query: "q".into(),
+            query_embedding: None,
             history: vec![],
             max_history_messages: None,
             max_context_size: None,
+            top_k: None,
+            max_block_chars: None,
             output_language: None,
             include_debug: false,
             retrieval_mode: Some("sources_only".into()),
         };
-        let compact =
-            build_retrieval_debug(&request, "sources_only", &["raw/sources".into()], 0, None);
+        let compact = build_retrieval_debug(
+            &request,
+            "sources_only",
+            &["raw/sources".into()],
+            0,
+            None,
+            None,
+        );
         assert_eq!(compact["retrieval_mode"], "sources_only");
         assert!(compact.get("scan_roots").is_none());
         assert!(compact.get("search_mode").is_none());
@@ -2227,6 +2463,7 @@ mod tests {
             "sources_only",
             &["raw/sources".into()],
             3,
+            None,
             Some(RetrievalSearchStats {
                 search_mode: "hybrid",
                 vector_hits: 4,
@@ -2371,6 +2608,160 @@ mod tests {
     }
 
     #[test]
+    fn chat_context_request_new_limits_are_optional_and_default_compatible() {
+        let request: ChatContextRequest =
+            serde_json::from_str(r#"{"query":"门店在哪里"}"#).unwrap();
+
+        assert_eq!(request.query_embedding, None);
+        assert_eq!(request.top_k, None);
+        assert_eq!(request.max_block_chars, None);
+        assert_eq!(DEFAULT_CHAT_CONTEXT_TOP_K, 10);
+    }
+
+    #[test]
+    fn chat_context_accepts_tenant_scoped_explicit_query_embedding() {
+        let request: ChatContextRequest =
+            serde_json::from_str(r#"{"query":"门店在哪里","query_embedding":[0.25,-0.5,0.75]}"#)
+                .unwrap();
+
+        assert_eq!(request.query_embedding, Some(vec![0.25, -0.5, 0.75]));
+    }
+
+    #[test]
+    fn vector_index_management_routes_fail_closed_for_unknown_project() {
+        for response in [
+            handle_vector_index_status("definitely-missing-project"),
+            handle_vector_clear_chunks("definitely-missing-project"),
+            handle_vector_optimize_chunks("definitely-missing-project"),
+            handle_vector_replace_all_chunks("definitely-missing-project", r#"{"pages":[]}"#),
+        ] {
+            assert_eq!(response.status, 404);
+            assert_eq!(response.body["error"]["code"], "PROJECT_NOT_FOUND");
+        }
+    }
+
+    #[test]
+    fn extreme_context_budget_is_clamped_without_overflow_or_unbounded_allocation() {
+        let body = format!(
+            r#"{{"query":"门店在哪里","max_context_size":{},"max_block_chars":{}}}"#,
+            usize::MAX,
+            usize::MAX
+        );
+        let request: ChatContextRequest = serde_json::from_str(&body).unwrap();
+        let budget = compute_context_budget(request.max_context_size);
+        let block_cap = compute_effective_max_block_chars(request.max_block_chars, &budget);
+
+        assert_eq!(budget.max_ctx, MAX_CHAT_CONTEXT_SIZE);
+        assert!(budget.response_reserve <= MAX_CHAT_CONTEXT_SIZE);
+        assert!(budget.index_budget <= MAX_CHAT_CONTEXT_SIZE);
+        assert!(budget.page_budget <= MAX_CHAT_CONTEXT_SIZE);
+        assert!(budget.max_page_size <= budget.page_budget);
+        assert_eq!(block_cap, Some(budget.page_budget));
+
+        // 极值只影响已夹紧的预算数值；装箱不会按请求中的 usize::MAX 预分配内存。
+        let result = sample_result("wiki/sources/stores.md", "门店清单", 0.8);
+        let (blocks, references) = assemble_context_blocks(vec![result], &budget, block_cap);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(references.len(), 1);
+        assert!(blocks[0]["content"].as_str().unwrap().chars().count() <= budget.page_budget);
+    }
+
+    #[test]
+    fn json_number_larger_than_usize_returns_parse_error_without_panicking() {
+        let parsed = std::panic::catch_unwind(|| {
+            serde_json::from_str::<ChatContextRequest>(
+                r#"{"query":"q","max_context_size":184467440737095516160}"#,
+            )
+        });
+
+        assert!(parsed.is_ok(), "超大 JSON 数值不得触发 panic");
+        assert!(parsed.unwrap().is_err(), "超出 usize 的数值必须稳定拒绝");
+    }
+
+    #[test]
+    fn explicit_per_block_cap_keeps_later_precise_source_and_native_scores() {
+        let budget = ContextBudget {
+            max_ctx: 500,
+            response_reserve: 75,
+            index_budget: 25,
+            page_budget: 240,
+            max_page_size: 50,
+        };
+        let mut broad = sample_result("wiki/entities/product.md", "产品总览", 0.9);
+        broad.content = Some("宽泛产品内容".repeat(30));
+        broad.graph_score = Some(0.4);
+        broad.rrf_score = Some(0.9);
+        broad.graph_related_to = vec!["产品".to_string()];
+        let mut distractors = (2..=5)
+            .map(|index| {
+                let mut result = sample_result(
+                    &format!("wiki/concepts/noise-{index}.md"),
+                    &format!("干扰候选{index}"),
+                    0.9 - index as f64 / 100.0,
+                );
+                result.content = Some("与当前问题相关度较低的维护内容".repeat(10));
+                result
+            })
+            .collect::<Vec<_>>();
+        let mut precise = sample_result("wiki/sources/stores.md", "门店清单", 0.8);
+        precise.content = Some("北京、上海、广州、成都四家门店完整地址".to_string());
+        let mut ordered = vec![broad];
+        ordered.append(&mut distractors);
+        ordered.push(precise);
+
+        let (blocks, references) = assemble_context_blocks(ordered, &budget, Some(20));
+
+        assert_eq!(blocks.len(), 6, "宽泛首块截取后仍应继续装入第六个精确来源");
+        assert_eq!(blocks[0]["content"].as_str().unwrap().chars().count(), 20);
+        assert_eq!(blocks[0]["path"], "wiki/entities/product.md");
+        assert_eq!(blocks[0]["score"], 0.9);
+        assert_eq!(blocks[0]["graphScore"], 0.4);
+        assert_eq!(blocks[0]["rrfScore"], 0.9);
+        assert_eq!(blocks[0]["graphRelatedTo"][0], "产品");
+        assert_eq!(blocks[5]["path"], "wiki/sources/stores.md");
+        assert_eq!(blocks[5]["score"], 0.8);
+        assert_eq!(references[5]["path"], "wiki/sources/stores.md");
+        assert_eq!(references[5]["score"], 0.8);
+        assert!(references[5].get("content").is_none());
+    }
+
+    #[test]
+    fn missing_per_block_cap_preserves_legacy_first_oversized_page_behavior() {
+        let budget = ContextBudget {
+            max_ctx: 40,
+            response_reserve: 6,
+            index_budget: 2,
+            page_budget: 20,
+            max_page_size: 10,
+        };
+        let mut broad = sample_result("wiki/entities/product.md", "产品总览", 0.9);
+        broad.content = Some("超长内容".repeat(20));
+        let precise = sample_result("wiki/sources/stores.md", "门店清单", 0.8);
+
+        let (blocks, references) = assemble_context_blocks(vec![broad, precise], &budget, None);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(references.len(), 1);
+        assert_eq!(blocks[0]["path"], "wiki/entities/product.md");
+        assert_eq!(blocks[0]["content"].as_str().unwrap().chars().count(), 10);
+    }
+
+    #[test]
+    fn retrieval_failure_uses_non_2xx_stable_envelope_without_internal_details() {
+        let response = retrieval_failed_response("/private/workspace/secret.md: permission denied");
+
+        assert_eq!(response.status, 502);
+        assert_eq!(response.body["ok"], false);
+        assert_eq!(response.body["error"]["code"], "RETRIEVAL_FAILED");
+        assert_eq!(
+            response.body["error"]["message"],
+            "Knowledge retrieval failed"
+        );
+        assert!(!response.body.to_string().contains("secret.md"));
+        assert!(!response.body.to_string().contains("permission denied"));
+    }
+
+    #[test]
     fn extract_text_path_resolution_rejects_traversal() {
         let root = test_dir("extract");
         fs::write(root.join("inside.md"), "hello extract").unwrap();
@@ -2379,11 +2770,8 @@ mod tests {
         let ok = resolve_project_file_path(&root_str, "inside.md").unwrap();
         assert!(ok.ends_with("inside.md"));
 
-        let abs_ok = resolve_project_file_path(
-            &root_str,
-            root.join("inside.md").to_str().unwrap(),
-        )
-        .unwrap();
+        let abs_ok =
+            resolve_project_file_path(&root_str, root.join("inside.md").to_str().unwrap()).unwrap();
         assert!(abs_ok.ends_with("inside.md"));
 
         let outside = std::env::temp_dir().join(format!(

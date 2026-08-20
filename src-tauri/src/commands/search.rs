@@ -336,6 +336,26 @@ pub async fn resolve_query_embedding(
     explicit_embedding: Option<Vec<f32>>,
     embedding_config: Option<SearchEmbeddingConfig>,
 ) -> Result<Option<Vec<f32>>, String> {
+    resolve_query_embedding_with_policy(query, explicit_embedding, embedding_config, true).await
+}
+
+/// 为 server-only chat-context 提供严格的查询向量解析。
+/// 普通桌面搜索继续允许 Provider 暂时失败后退化为关键词；自动客服上下文必须区分
+/// “确实无召回”与“Embedding 检索失败”，因此这里会把 Provider 异常向上返回。
+pub async fn resolve_query_embedding_strict(
+    query: &str,
+    explicit_embedding: Option<Vec<f32>>,
+    embedding_config: Option<SearchEmbeddingConfig>,
+) -> Result<Option<Vec<f32>>, String> {
+    resolve_query_embedding_with_policy(query, explicit_embedding, embedding_config, false).await
+}
+
+async fn resolve_query_embedding_with_policy(
+    query: &str,
+    explicit_embedding: Option<Vec<f32>>,
+    embedding_config: Option<SearchEmbeddingConfig>,
+    allow_provider_failure_fallback: bool,
+) -> Result<Option<Vec<f32>>, String> {
     if let Some(embedding) = explicit_embedding {
         return validate_query_embedding(embedding).map(Some);
     }
@@ -345,12 +365,23 @@ pub async fn resolve_query_embedding(
     if !cfg.enabled || cfg.endpoint.trim().is_empty() || cfg.model.trim().is_empty() {
         return Ok(None);
     }
-    match fetch_embedding_with_retry(query, &cfg, 0).await {
+    finish_query_embedding_fetch(
+        fetch_embedding_with_retry(query, &cfg, 0).await,
+        allow_provider_failure_fallback,
+    )
+}
+
+fn finish_query_embedding_fetch(
+    fetched: Result<Vec<f32>, String>,
+    allow_provider_failure_fallback: bool,
+) -> Result<Option<Vec<f32>>, String> {
+    match fetched {
         Ok(embedding) => validate_query_embedding(embedding).map(Some),
-        Err(err) => {
+        Err(err) if allow_provider_failure_fallback => {
             eprintln!("[Search] embedding disabled for this request: {err}");
             Ok(None)
         }
+        Err(err) => Err(format!("query embedding failed: {err}")),
     }
 }
 
@@ -470,8 +501,7 @@ pub async fn search_project_by_mode_inner(
 
 type VectorSearchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<PageVectorResult>, String>> + Send + 'a>>;
-type VectorSearchFn =
-    for<'a> fn(&'a str, Vec<f32>, usize) -> VectorSearchFuture<'a>;
+type VectorSearchFn = for<'a> fn(&'a str, Vec<f32>, usize) -> VectorSearchFuture<'a>;
 
 async fn search_project_by_mode_with_vector_search(
     project_path: String,
@@ -501,41 +531,46 @@ async fn search_project_by_mode_with_vector_search(
     let roots = normalize_scan_roots(scan_roots);
     let include_wiki = roots.iter().any(|root| is_wiki_scan_root(root));
     let mut searched_files = 0usize;
-    let mut hit_file_cap = false;
 
     for root_rel in &roots {
-        if hit_file_cap {
-            break;
-        }
         let scan_root = Path::new(&project_path).join(root_rel);
         if !scan_root.exists() {
             // Missing roots are skipped (no 500) so sources_only/hybrid stay resilient.
             continue;
         }
         let root_is_wiki = is_wiki_scan_root(root_rel);
-        for entry in WalkDir::new(&scan_root).into_iter().filter_map(Result::ok) {
+        for entry in WalkDir::new(&scan_root) {
+            // 正式检索不能把目录遍历异常静默当成“没有知识”；上层会把该错误转换成
+            // 可区分的 RETRIEVAL_FAILED，而不会返回 200 + EMPTY_CONTEXT。
+            let entry = entry.map_err(|err| format!("Failed to scan retrieval root: {err}"))?;
             let ext = entry.path().extension().and_then(|s| s.to_str());
-            if !entry.file_type().is_file() || (ext != Some("md") && ext != Some("txt")) {
+            if !entry.file_type().is_file()
+                || (ext != Some("md") && ext != Some("txt"))
+                || is_internal_search_artifact(
+                    entry
+                        .path()
+                        .strip_prefix(&scan_root)
+                        .unwrap_or(entry.path()),
+                )
+            {
                 continue;
             }
-            searched_files += 1;
+            searched_files = searched_files.saturating_add(1);
             if searched_files > MAX_SEARCH_FILES {
-                eprintln!(
-                    "[Search] stopped scanning after {MAX_SEARCH_FILES} markdown/text files in {project_path} (roots={roots:?})"
-                );
-                hit_file_cap = true;
-                break;
+                // 返回部分结果会让调用方无法区分“真实无召回”和“只扫描了前一部分文件”。
+                // 因此超过受控上限时明确失败，由 chat-context 输出 RETRIEVAL_FAILED。
+                return Err(format!(
+                    "retrieval candidate limit exceeded ({MAX_SEARCH_FILES})"
+                ));
             }
-            let content = match fs::read_to_string(entry.path()) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
+            let content = fs::read_to_string(entry.path())
+                .map_err(|err| format!("Failed to read retrieval candidate: {err}"))?;
             let relative_path = relative_to_project(&project_path, entry.path());
             // Vector store page_ids are wiki-stem based; only index wiki stems.
             if root_is_wiki {
                 if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                    let previous = page_paths_by_stem
-                        .insert(stem.to_string(), relative_path.clone());
+                    let previous =
+                        page_paths_by_stem.insert(stem.to_string(), relative_path.clone());
                     if let Some(previous) = previous {
                         eprintln!(
                             "[Search] duplicate wiki page stem '{stem}': '{previous}' and '{relative_path}' share one vector page_id"
@@ -608,7 +643,7 @@ async fn search_project_by_mode_with_vector_search(
                     &project_path,
                     &mut results,
                     include_content,
-                );
+                )?;
             }
         }
     }
@@ -647,6 +682,39 @@ async fn search_project_by_mode_with_vector_search(
         graph_hits,
         results,
     })
+}
+
+/// 判断文件是否属于编辑器临时文件、维护副本或备份目录。
+/// 这里只过滤具有明确维护语义的命名，不按 `wiki/sources`、entity、concept 等业务目录过滤，
+/// 因而不会误伤 LLMWiki 的合法结构化知识页。
+fn is_internal_search_artifact(path: &Path) -> bool {
+    let has_internal_directory = path.components().any(|component| {
+        let value = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        value.starts_with('.')
+            || matches!(
+                value.as_str(),
+                "backup" | "backups" | "_backup" | "_backups" | "tmp" | "temp"
+            )
+    });
+    if has_internal_directory {
+        return true;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    file_name.starts_with(".#")
+        || file_name.ends_with('~')
+        || file_name.ends_with(".bak")
+        || file_name.ends_with(".backup")
+        || file_name.ends_with(".tmp")
+        || file_name.ends_with(".temp")
+        || file_name.contains(".bak.")
+        || file_name.contains(".backup.")
+        || file_name.contains(".tmp.")
+        || file_name.contains(".temp.")
 }
 
 fn rank_results_for_mode(
@@ -952,6 +1020,23 @@ struct PageVectorResult {
     heading_path: String,
 }
 
+/// 把同一页面的多个分块分数聚合为页面分数。
+///
+/// 最高相关分块是页面入选的主要依据；其余分块仅以平均值贡献 10% 的稳定性信号。
+/// 禁止按分块数量直接累加，否则长页面会因为分块多而轻易饱和到 1.0，反向挤掉
+/// 真正相关但较短的来源页。
+fn blend_page_chunk_scores(chunks: &[vectorstore::ChunkSearchResult]) -> f32 {
+    let Some(first) = chunks.first() else {
+        return 0.0;
+    };
+    if chunks.len() == 1 {
+        return first.score;
+    }
+    let tail_average =
+        chunks.iter().skip(1).map(|chunk| chunk.score).sum::<f32>() / (chunks.len() - 1) as f32;
+    (first.score * 0.9) + (tail_average * 0.1)
+}
+
 async fn search_by_embedding(
     project_path: &str,
     query_embedding: Vec<f32>,
@@ -984,9 +1069,7 @@ async fn search_by_embedding(
                 .then_with(|| a.chunk_index.cmp(&b.chunk_index))
         });
         let top_chunk = chunks[0].clone();
-        let top = top_chunk.score;
-        let tail: f32 = chunks.iter().skip(1).map(|chunk| chunk.score).sum();
-        let blended = top + (tail * 0.3).min((1.0 - top).max(0.0));
+        let blended = blend_page_chunk_scores(&chunks);
         ranked.push(PageVectorResult {
             id,
             score: blended,
@@ -1009,11 +1092,7 @@ fn search_by_embedding_boxed<'a>(
     query_embedding: Vec<f32>,
     top_k: usize,
 ) -> VectorSearchFuture<'a> {
-    Box::pin(search_by_embedding(
-        project_path,
-        query_embedding,
-        top_k,
-    ))
+    Box::pin(search_by_embedding(project_path, query_embedding, top_k))
 }
 
 fn materialize_vector_only_results(
@@ -1022,7 +1101,7 @@ fn materialize_vector_only_results(
     project_path: &str,
     results: &mut Vec<ProjectSearchResult>,
     include_content: bool,
-) {
+) -> Result<(), String> {
     let mut known: BTreeSet<String> = results.iter().map(|r| file_stem(&r.path)).collect();
     for vr in vector_results {
         if known.contains(&vr.id) {
@@ -1030,9 +1109,10 @@ fn materialize_vector_only_results(
         }
         if let Some(rel) = page_paths_by_stem.get(&vr.id) {
             let path = Path::new(project_path).join(rel);
-            let Ok(content) = fs::read_to_string(&path) else {
-                continue;
-            };
+            // 扫描完成到向量物化之间文件仍可能被删除或变为不可读；不能把这种竞态
+            // 静默降级成少一个候选，否则最终可能被误判为 EMPTY_CONTEXT。
+            let content = fs::read_to_string(&path)
+                .map_err(|err| format!("Failed to materialize vector candidate: {err}"))?;
             let file_name = Path::new(&rel)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -1056,6 +1136,7 @@ fn materialize_vector_only_results(
             known.insert(vr.id.clone());
         }
     }
+    Ok(())
 }
 
 fn build_vector_snippet(result: &PageVectorResult) -> String {
@@ -1979,6 +2060,20 @@ mod tests {
     }
 
     #[test]
+    fn chat_context_embedding_policy_propagates_provider_failure() {
+        let strict =
+            finish_query_embedding_fetch(Err("injected provider outage".to_string()), false)
+                .unwrap_err();
+        assert!(strict.contains("query embedding failed"));
+        assert!(strict.contains("injected provider outage"));
+
+        let desktop_fallback =
+            finish_query_embedding_fetch(Err("injected provider outage".to_string()), true)
+                .unwrap();
+        assert_eq!(desktop_fallback, None);
+    }
+
+    #[test]
     fn google_embedding_endpoint_strips_key_and_normalizes_batch_endpoint() {
         let cfg = SearchEmbeddingConfig {
             enabled: true,
@@ -2319,10 +2414,7 @@ mod tests {
         assert!(value["results"][0]["graphScore"].is_null());
         assert!(value["results"][0]["rrfScore"].is_null());
         // Cross-language wire contract: graphRelatedTo is always present, even empty.
-        assert_eq!(
-            value["results"][0]["graphRelatedTo"],
-            serde_json::json!([])
-        );
+        assert_eq!(value["results"][0]["graphRelatedTo"], serde_json::json!([]));
         assert!(value["results"][0].get("content").is_none());
     }
 
@@ -2397,7 +2489,8 @@ mod tests {
             &root.to_string_lossy(),
             &mut results,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "wiki/custom/deep-page.md");
@@ -2405,6 +2498,33 @@ mod tests {
         assert_eq!(results[0].vector_score, Some(0.91));
         assert!(results[0].snippet.contains("Section > Detail"));
         assert!(results[0].snippet.contains("semantic chunk"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn vector_candidate_materialization_propagates_missing_file_error() {
+        let root = tmp_project();
+        let vector_results = vec![PageVectorResult {
+            id: "missing-page".to_string(),
+            score: 0.8,
+            chunk_text: "stale vector chunk".to_string(),
+            heading_path: String::new(),
+        }];
+        let pages = BTreeMap::from([(
+            "missing-page".to_string(),
+            "wiki/concepts/missing-page.md".to_string(),
+        )]);
+
+        let error = materialize_vector_only_results(
+            &vector_results,
+            &pages,
+            &root.to_string_lossy(),
+            &mut Vec::new(),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Failed to materialize vector candidate"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2418,6 +2538,31 @@ mod tests {
         };
 
         assert_eq!(build_vector_snippet(&vector), "");
+    }
+
+    #[test]
+    fn page_vector_score_does_not_reward_chunk_count_or_saturate() {
+        let chunk = |index: u32, score: f32| vectorstore::ChunkSearchResult {
+            chunk_id: format!("page#{index}"),
+            page_id: "page".to_string(),
+            chunk_index: index,
+            chunk_text: String::new(),
+            heading_path: String::new(),
+            score,
+        };
+
+        let short_page = vec![chunk(0, 0.82)];
+        let long_noise_page = vec![
+            chunk(0, 0.70),
+            chunk(1, 0.70),
+            chunk(2, 0.70),
+            chunk(3, 0.70),
+            chunk(4, 0.70),
+        ];
+
+        assert!((blend_page_chunk_scores(&short_page) - 0.82).abs() < 0.000001);
+        assert!((blend_page_chunk_scores(&long_noise_page) - 0.70).abs() < 0.000001);
+        assert!(blend_page_chunk_scores(&short_page) > blend_page_chunk_scores(&long_noise_page));
     }
 
     #[tokio::test]
@@ -2449,6 +2594,65 @@ mod tests {
         assert_eq!(out.results[0].title, "Attention");
         assert!(out.results[0].title_match);
         assert!(out.results[0].score > 100.0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn formal_search_excludes_backups_and_keeps_legitimate_wiki_structures() {
+        let root = tmp_project();
+        write_page(
+            &root,
+            "wiki/sources/store-source.md",
+            "---\ntitle: 门店地址来源\n---\n\n门店地址证据。",
+        );
+        write_page(
+            &root,
+            "wiki/entities/store.md",
+            "---\ntitle: 门店实体\n---\n\n门店地址实体。",
+        );
+        write_page(
+            &root,
+            "wiki/concepts/store.md",
+            "---\ntitle: 门店概念\n---\n\n门店地址概念。",
+        );
+        write_page(
+            &root,
+            "wiki/entities/store.bak.md",
+            "---\ntitle: 门店地址备份\n---\n\n门店地址备份。",
+        );
+        write_page(
+            &root,
+            "wiki/backups/store.md",
+            "---\ntitle: 门店地址维护副本\n---\n\n门店地址维护副本。",
+        );
+        write_page(
+            &root,
+            "wiki/.maintenance/store.md",
+            "---\ntitle: 门店地址临时副本\n---\n\n门店地址临时副本。",
+        );
+
+        let output = search_project_inner(
+            root.to_string_lossy().to_string(),
+            "门店地址".to_string(),
+            50,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let paths = output
+            .results
+            .iter()
+            .map(|result| result.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"wiki/sources/store-source.md"));
+        assert!(paths.contains(&"wiki/entities/store.md"));
+        assert!(paths.contains(&"wiki/concepts/store.md"));
+        assert!(!paths.iter().any(|path| path.contains(".bak.")));
+        assert!(!paths.iter().any(|path| path.contains("/backups/")));
+        assert!(!paths.iter().any(|path| path.contains("/.maintenance/")));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2760,7 +2964,11 @@ mod tests {
         assert!(
             wiki_miss.results.is_empty(),
             "sources_only must not return wiki hits: {:?}",
-            wiki_miss.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+            wiki_miss
+                .results
+                .iter()
+                .map(|r| &r.path)
+                .collect::<Vec<_>>()
         );
 
         let hybrid = search_project_inner(
