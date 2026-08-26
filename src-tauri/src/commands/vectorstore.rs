@@ -7,7 +7,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::{AddDataMode, CompactionOptions, OptimizeAction};
 use lancedb::{connect, DistanceType};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::panic_guard::run_guarded_async;
@@ -72,8 +72,54 @@ const TABLE_V1: &str = "wiki_vectors";
 /// represented by multiple rows sharing the same `page_id`.
 const TABLE_V2: &str = "wiki_chunks_v2";
 const MAX_PAGE_ID_CHARS: usize = 256;
+/// 单次 scoped vector 查询允许的页面数量上限，与 chat-context 资源 allowlist 上限一致。
+/// 该上限同时约束 SQL filter 长度，防止内部调用错误制造超大查询表达式。
+const MAX_SCOPED_VECTOR_PAGE_IDS: usize = 256;
 static VECTORSTORE_V2_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>> =
     OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VectorPageScope {
+    /// 旧调用方未提供范围，保持全项目向量检索行为。
+    Unrestricted,
+    /// 显式范围内没有 wiki 页面，必须直接返回空结果，不能退化为全项目查询。
+    Empty,
+    /// 经 page_id 合同校验、去重后的 LanceDB prefilter。
+    Filter(String),
+}
+
+/// 把内部传入的 page_id allowlist 编译成受控 LanceDB prefilter。
+///
+/// `page_id` 的公共校验合同已经禁止单引号、双引号、路径分隔符和不可见字符，因此这里
+/// 可以安全构造 SQL `IN` 表达式。过滤器在 ANN top-k 之前由 LanceDB 执行，不需要扩大
+/// limit，也不会让未授权页面占据候选名额。复杂度为 O(n log n) 去重与 O(n) filter
+/// 构造，n 被硬限制为 256；向量查询仍使用 LanceDB 原生索引和 prefilter。
+fn compile_vector_page_scope(
+    allowed_page_ids: Option<Vec<String>>,
+) -> Result<VectorPageScope, String> {
+    let Some(page_ids) = allowed_page_ids else {
+        return Ok(VectorPageScope::Unrestricted);
+    };
+    if page_ids.is_empty() {
+        return Ok(VectorPageScope::Empty);
+    }
+    if page_ids.len() > MAX_SCOPED_VECTOR_PAGE_IDS {
+        return Err("Scoped vector page allowlist exceeds the supported limit".to_string());
+    }
+
+    let mut validated = BTreeSet::new();
+    for page_id in page_ids {
+        validate_page_id_for_v2(&page_id)
+            .map_err(|_| "Scoped vector page allowlist contains an invalid page id".to_string())?;
+        validated.insert(page_id);
+    }
+    let values = validated
+        .into_iter()
+        .map(|page_id| format!("'{page_id}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(VectorPageScope::Filter(format!("page_id IN ({values})")))
+}
 
 /// Validate page_id to prevent filter/path injection without rejecting
 /// legitimate Unicode wiki filenames. Page ids are wiki file stems; CJK
@@ -628,6 +674,25 @@ pub async fn vector_search_chunks(
     query_embedding: Vec<f32>,
     top_k: usize,
 ) -> Result<Vec<ChunkSearchResult>, String> {
+    vector_search_chunks_scoped(project_path, query_embedding, top_k, None).await
+}
+
+/// 在可选 page_id allowlist 内执行原生 LanceDB 向量 top-k。
+///
+/// 这是 Core 搜索层复用的窄接口，不暴露为新的 Tauri 命令。`None` 保持旧全项目行为；
+/// `Some` 会先编译成 LanceDB `.only_if(...)` prefilter，再执行向量 top-k。显式空集合
+/// 直接返回空结果，避免任何隐式全库回退。
+pub async fn vector_search_chunks_scoped(
+    project_path: String,
+    query_embedding: Vec<f32>,
+    top_k: usize,
+    allowed_page_ids: Option<Vec<String>>,
+) -> Result<Vec<ChunkSearchResult>, String> {
+    let page_scope = compile_vector_page_scope(allowed_page_ids)?;
+    if matches!(page_scope, VectorPageScope::Empty) {
+        return Ok(Vec::new());
+    }
+
     run_guarded_async("vector_search_chunks", async move {
         let lock = vectorstore_v2_lock(&project_path);
         let _guard = lock.read().await;
@@ -653,12 +718,19 @@ pub async fn vector_search_chunks(
             .await
             .map_err(|e| format!("Open table error: {e}"))?;
 
-        let results_stream = table
+        let query = table
             .vector_search(query_embedding)
             .map_err(|e| format!("Search error: {e}"))?
             // v2 是当前生产索引。与旧表保持同一余弦语义，避免未归一化向量在
             // 默认 L2 距离下出现“数值接近但语义无关”的错误排序。
-            .distance_type(DistanceType::Cosine)
+            .distance_type(DistanceType::Cosine);
+        let query = match page_scope {
+            VectorPageScope::Filter(filter) => query.only_if(filter),
+            VectorPageScope::Unrestricted => query,
+            // Empty 已在建立数据库连接前返回；保留穷尽分支防止未来 enum 扩展误放宽。
+            VectorPageScope::Empty => return Ok(Vec::new()),
+        };
+        let results_stream = query
             .limit(top_k)
             .execute()
             .await
@@ -1031,6 +1103,34 @@ mod tests_v2 {
     }
 
     #[test]
+    fn scoped_vector_page_filter_is_bounded_validated_and_default_compatible() {
+        assert_eq!(
+            compile_vector_page_scope(None).unwrap(),
+            VectorPageScope::Unrestricted
+        );
+        assert_eq!(
+            compile_vector_page_scope(Some(Vec::new())).unwrap(),
+            VectorPageScope::Empty
+        );
+        assert_eq!(
+            compile_vector_page_scope(Some(vec![
+                "页面乙".to_string(),
+                "页面甲".to_string(),
+                "页面乙".to_string(),
+            ]))
+            .unwrap(),
+            VectorPageScope::Filter("page_id IN ('页面乙', '页面甲')".to_string())
+        );
+        assert!(compile_vector_page_scope(Some(vec!["bad'quote".to_string()])).is_err());
+        assert!(compile_vector_page_scope(Some(
+            (0..=MAX_SCOPED_VECTOR_PAGE_IDS)
+                .map(|index| format!("page-{index}"))
+                .collect()
+        ))
+        .is_err());
+    }
+
+    #[test]
     fn page_id_validation_rejects_filter_and_path_footguns() {
         for page_id in [
             "bad'quote",
@@ -1279,6 +1379,79 @@ mod tests_v2 {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].page_id, "page-a");
         assert!(results[0].score > results[1].score);
+    }
+
+    #[tokio::test]
+    async fn scoped_vector_prefilter_finds_authorized_page_outside_global_top_k() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+
+        // 12 个未授权页面与查询方向高度接近；授权页面与查询正交，因此必定落在全局
+        // top10 之外。scoped 查询若先全局 top-k 再过滤会错误返回空；LanceDB prefilter
+        // 则先限定 page_id，再在授权集合内计算真实 top-k。
+        for index in 0..12 {
+            let page_id = format!("unauthorized-{index:02}");
+            vector_upsert_chunks(
+                pp.clone(),
+                page_id.clone(),
+                vec![ChunkUpsertInput {
+                    chunk_index: 0,
+                    chunk_text: format!("未授权高相似向量 {index}"),
+                    heading_path: "## 未授权".into(),
+                    embedding: vec![1.0, (index as f32 + 1.0) / 10_000.0],
+                }],
+            )
+            .await
+            .unwrap();
+        }
+        vector_upsert_chunks(
+            pp.clone(),
+            "authorized-target".into(),
+            vec![ChunkUpsertInput {
+                chunk_index: 0,
+                chunk_text: "授权页面的真实语义块".into(),
+                heading_path: "## 授权目标".into(),
+                embedding: vec![0.0, 1.0],
+            }],
+        )
+        .await
+        .unwrap();
+
+        let global = vector_search_chunks(pp.clone(), vec![1.0, 0.0], 10)
+            .await
+            .unwrap();
+        assert_eq!(global.len(), 10);
+        assert!(global
+            .iter()
+            .all(|result| result.page_id != "authorized-target"));
+
+        let scoped = vector_search_chunks_scoped(
+            pp.clone(),
+            vec![1.0, 0.0],
+            10,
+            Some(vec!["authorized-target".to_string()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].page_id, "authorized-target");
+
+        let multiple = vector_search_chunks_scoped(
+            pp,
+            vec![1.0, 0.0],
+            10,
+            Some(vec![
+                "authorized-target".to_string(),
+                "unauthorized-00".to_string(),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(multiple.len(), 2);
+        assert!(multiple.iter().all(|result| matches!(
+            result.page_id.as_str(),
+            "authorized-target" | "unauthorized-00"
+        )));
     }
 
     #[tokio::test]

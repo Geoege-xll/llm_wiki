@@ -404,27 +404,54 @@ pub fn normalize_scan_roots(scan_roots: Option<Vec<String>>) -> Vec<String> {
     };
     let mut out = Vec::new();
     for root in candidates {
-        let cleaned = root.replace('\\', "/");
-        let cleaned = cleaned.trim().trim_matches('/').to_string();
-        if cleaned.is_empty() || cleaned.contains("..") || cleaned.starts_with('/') {
-            continue;
-        }
-        // P0 allowlist: wiki + raw sources (and their subpaths).
-        let allowed = cleaned == "wiki"
-            || cleaned == "raw/sources"
-            || cleaned.starts_with("wiki/")
-            || cleaned.starts_with("raw/sources/");
-        if !allowed {
-            continue;
-        }
-        if !out.iter().any(|existing: &String| existing == &cleaned) {
-            out.push(cleaned);
+        if let Some(cleaned) = normalize_scan_root(&root) {
+            if !out.iter().any(|existing: &String| existing == &cleaned) {
+                out.push(cleaned);
+            }
         }
     }
     if out.is_empty() {
         out.push("wiki".to_string());
     }
     out
+}
+
+/// 规范化单个 Core 检索根，并限制在既有 wiki / raw sources 能力边界内。
+fn normalize_scan_root(root: &str) -> Option<String> {
+    let separator_normalized = root.replace('\\', "/");
+    let trimmed = separator_normalized.trim();
+    if trimmed.starts_with('/') {
+        return None;
+    }
+    let cleaned = trimmed.trim_matches('/').to_string();
+    if cleaned.is_empty() || cleaned.contains("..") {
+        return None;
+    }
+    // P0 allowlist: wiki + raw sources (and their subpaths).
+    let allowed = cleaned == "wiki"
+        || cleaned == "raw/sources"
+        || cleaned.starts_with("wiki/")
+        || cleaned.starts_with("raw/sources/");
+    allowed.then_some(cleaned)
+}
+
+/// 显式资源搜索使用的 fail-closed 根规范化。
+///
+/// 与 `normalize_scan_roots` 的旧兼容行为不同，本函数遇到任意非法根或最终空集合都会
+/// 返回错误，绝不回退到默认 wiki 全库。重复合法根只做确定性去重。
+fn normalize_scoped_scan_roots(scan_roots: Vec<String>) -> Result<Vec<String>, String> {
+    if scan_roots.is_empty() {
+        return Err("Scoped project search requires at least one validated scan root".to_string());
+    }
+    let mut normalized = Vec::new();
+    for root in scan_roots {
+        let root = normalize_scan_root(&root)
+            .ok_or_else(|| "Scoped project search received an invalid scan root".to_string())?;
+        if !normalized.contains(&root) {
+            normalized.push(root);
+        }
+    }
+    Ok(normalized)
 }
 
 fn is_wiki_scan_root(root: &str) -> bool {
@@ -439,7 +466,55 @@ pub async fn search_project_inner(
     query_embedding: Option<Vec<f32>>,
     scan_roots: Option<Vec<String>>,
 ) -> Result<ProjectSearchResponse, String> {
-    let mut response = search_project_by_mode_inner(
+    search_project_inner_with_scope(
+        project_path,
+        query,
+        top_k,
+        include_content,
+        query_embedding,
+        scan_roots,
+        false,
+    )
+    .await
+}
+
+/// 在显式扫描文件集合内执行完整 BM25 / Vector / Graph / Hybrid 检索。
+///
+/// 与历史入口的唯一区别是：向量层会把本次实际扫描到的 wiki page_id 集合作为
+/// LanceDB prefilter，在 ANN top-k 前限制候选。BM25 与 Graph 本就从 scan roots 构造
+/// 候选和图谱，因此四类算子现在共享同一个授权集合。调用方必须只传已经完成文件系统
+/// 安全验证的精确 scan roots；显式空范围应在上层失败关闭，不能调用本函数。
+pub async fn search_project_scoped_inner(
+    project_path: String,
+    query: String,
+    top_k: usize,
+    include_content: bool,
+    query_embedding: Option<Vec<f32>>,
+    scan_roots: Vec<String>,
+) -> Result<ProjectSearchResponse, String> {
+    let scan_roots = normalize_scoped_scan_roots(scan_roots)?;
+    search_project_inner_with_scope(
+        project_path,
+        query,
+        top_k,
+        include_content,
+        query_embedding,
+        Some(scan_roots),
+        true,
+    )
+    .await
+}
+
+async fn search_project_inner_with_scope(
+    project_path: String,
+    query: String,
+    top_k: usize,
+    include_content: bool,
+    query_embedding: Option<Vec<f32>>,
+    scan_roots: Option<Vec<String>>,
+    scope_vector_to_scanned_pages: bool,
+) -> Result<ProjectSearchResponse, String> {
+    let mut response = search_project_by_mode_with_vector_search(
         project_path,
         query,
         top_k,
@@ -447,6 +522,8 @@ pub async fn search_project_inner(
         query_embedding,
         scan_roots,
         SearchMode::Hybrid,
+        search_by_embedding_boxed,
+        scope_vector_to_scanned_pages,
     )
     .await?;
     match search_mode(
@@ -495,13 +572,15 @@ pub async fn search_project_by_mode_inner(
         scan_roots,
         mode,
         search_by_embedding_boxed,
+        false,
     )
     .await
 }
 
 type VectorSearchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<PageVectorResult>, String>> + Send + 'a>>;
-type VectorSearchFn = for<'a> fn(&'a str, Vec<f32>, usize) -> VectorSearchFuture<'a>;
+type VectorSearchFn =
+    for<'a> fn(&'a str, Vec<f32>, usize, Option<Vec<String>>) -> VectorSearchFuture<'a>;
 
 async fn search_project_by_mode_with_vector_search(
     project_path: String,
@@ -512,6 +591,7 @@ async fn search_project_by_mode_with_vector_search(
     scan_roots: Option<Vec<String>>,
     mode: SearchMode,
     vector_search: VectorSearchFn,
+    scope_vector_to_scanned_pages: bool,
 ) -> Result<ProjectSearchResponse, String> {
     if query.trim().is_empty() {
         return Err("query is required".to_string());
@@ -630,9 +710,12 @@ async fn search_project_by_mode_with_vector_search(
     if mode.uses_vector() && include_wiki {
         if let Some(embedding) = query_embedding {
             if !embedding.is_empty() {
-                let vector_results = vector_search(&project_path, embedding, limit.max(10))
-                    .await
-                    .map_err(|err| format!("{} vector search failed: {err}", mode.as_str()))?;
+                let allowed_page_ids = scope_vector_to_scanned_pages
+                    .then(|| page_paths_by_stem.keys().cloned().collect::<Vec<_>>());
+                let vector_results =
+                    vector_search(&project_path, embedding, limit.max(10), allowed_page_ids)
+                        .await
+                        .map_err(|err| format!("{} vector search failed: {err}", mode.as_str()))?;
                 vector_hits = vector_results.len();
                 for vr in &vector_results {
                     vector_score.insert(vr.id.clone(), vr.score);
@@ -1041,11 +1124,13 @@ async fn search_by_embedding(
     project_path: &str,
     query_embedding: Vec<f32>,
     top_k: usize,
+    allowed_page_ids: Option<Vec<String>>,
 ) -> Result<Vec<PageVectorResult>, String> {
-    let raw_chunks = vectorstore::vector_search_chunks(
+    let raw_chunks = vectorstore::vector_search_chunks_scoped(
         project_path.to_string(),
         query_embedding,
         (top_k * 3).max(30),
+        allowed_page_ids,
     )
     .await?;
     if raw_chunks.is_empty() {
@@ -1091,8 +1176,14 @@ fn search_by_embedding_boxed<'a>(
     project_path: &'a str,
     query_embedding: Vec<f32>,
     top_k: usize,
+    allowed_page_ids: Option<Vec<String>>,
 ) -> VectorSearchFuture<'a> {
-    Box::pin(search_by_embedding(project_path, query_embedding, top_k))
+    Box::pin(search_by_embedding(
+        project_path,
+        query_embedding,
+        top_k,
+        allowed_page_ids,
+    ))
 }
 
 fn materialize_vector_only_results(
@@ -2705,6 +2796,7 @@ mod tests {
         _project_path: &'a str,
         _query_embedding: Vec<f32>,
         _top_k: usize,
+        _allowed_page_ids: Option<Vec<String>>,
     ) -> VectorSearchFuture<'a> {
         Box::pin(async { Err("injected vector store failure".to_string()) })
     }
@@ -2728,6 +2820,7 @@ mod tests {
                 None,
                 mode,
                 injected_vector_store_failure,
+                false,
             )
             .await
             .unwrap_err();
@@ -2736,6 +2829,111 @@ mod tests {
             assert!(error.contains(mode.as_str()));
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scoped_search_applies_page_allowlist_before_vector_top_k_and_hybrid_ranking() {
+        let root = tmp_project();
+        let project_path = root.to_string_lossy().to_string();
+        write_page(
+            &root,
+            "wiki/authorized-target.md",
+            "---\ntitle: 授权目标\n---\n\n# 授权目标\n\n共享授权资料。",
+        );
+        write_page(
+            &root,
+            "wiki/authorized-second.md",
+            "---\ntitle: 第二授权页\n---\n\n# 第二授权页\n\n共享授权补充。",
+        );
+
+        // 未授权页面都比目标向量更接近查询，确保授权目标位于全项目 vector top10 外。
+        for index in 0..12 {
+            let page_id = format!("unauthorized-{index:02}");
+            write_page(
+                &root,
+                &format!("wiki/{page_id}.md"),
+                &format!("# 未授权页面 {index}\n\n不包含查询词。"),
+            );
+            vectorstore::vector_upsert_chunks(
+                project_path.clone(),
+                page_id,
+                vec![vectorstore::ChunkUpsertInput {
+                    chunk_index: 0,
+                    chunk_text: "未授权高相似向量".into(),
+                    heading_path: "## 未授权".into(),
+                    embedding: vec![1.0, (index as f32 + 1.0) / 10_000.0],
+                }],
+            )
+            .await
+            .unwrap();
+        }
+        for (page_id, embedding) in [
+            ("authorized-target", vec![0.0, 1.0]),
+            ("authorized-second", vec![0.1, 0.9]),
+        ] {
+            vectorstore::vector_upsert_chunks(
+                project_path.clone(),
+                page_id.to_string(),
+                vec![vectorstore::ChunkUpsertInput {
+                    chunk_index: 0,
+                    chunk_text: format!("{page_id} 授权语义块"),
+                    heading_path: "## 授权".into(),
+                    embedding,
+                }],
+            )
+            .await
+            .unwrap();
+        }
+
+        let global = search_project_inner(
+            project_path.clone(),
+            "zzqv_scope_nonce_9f3a".into(),
+            10,
+            true,
+            Some(vec![1.0, 0.0]),
+            Some(vec!["wiki".into()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(global.mode, "vector");
+        assert!(global
+            .results
+            .iter()
+            .all(|result| result.path != "wiki/authorized-target.md"));
+
+        let scoped_vector = search_project_scoped_inner(
+            project_path.clone(),
+            "zzqv_scope_nonce_9f3a".into(),
+            10,
+            true,
+            Some(vec![1.0, 0.0]),
+            vec!["wiki/authorized-target.md".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped_vector.mode, "vector");
+        assert_eq!(scoped_vector.results.len(), 1);
+        assert_eq!(scoped_vector.results[0].path, "wiki/authorized-target.md");
+
+        let scoped_hybrid = search_project_scoped_inner(
+            project_path,
+            "共享授权".into(),
+            10,
+            true,
+            Some(vec![1.0, 0.0]),
+            vec![
+                "wiki/authorized-target.md".into(),
+                "wiki/authorized-second.md".into(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped_hybrid.mode, "hybrid");
+        assert_eq!(scoped_hybrid.vector_hits, 2);
+        assert!(scoped_hybrid.results.iter().all(|result| matches!(
+            result.path.as_str(),
+            "wiki/authorized-target.md" | "wiki/authorized-second.md"
+        )));
     }
 
     #[tokio::test]
@@ -2757,6 +2955,7 @@ mod tests {
                 None,
                 mode,
                 injected_vector_store_failure,
+                false,
             )
             .await
             .unwrap();
@@ -2920,6 +3119,19 @@ mod tests {
         assert_eq!(
             normalize_scan_roots(Some(vec!["secret".into()])),
             vec!["wiki".to_string()]
+        );
+        assert!(normalize_scoped_scan_roots(Vec::new()).is_err());
+        assert!(normalize_scoped_scan_roots(vec!["secret".into()]).is_err());
+        assert!(normalize_scoped_scan_roots(vec!["/wiki/private.md".into()]).is_err());
+        assert!(normalize_scoped_scan_roots(vec!["../wiki/private.md".into()]).is_err());
+        assert_eq!(
+            normalize_scoped_scan_roots(vec![
+                "wiki/a.md".into(),
+                "wiki/a.md".into(),
+                "raw/sources/b.md".into(),
+            ])
+            .unwrap(),
+            vec!["wiki/a.md", "raw/sources/b.md"]
         );
     }
 

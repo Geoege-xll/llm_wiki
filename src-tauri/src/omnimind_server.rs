@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -22,6 +22,16 @@ const MAX_CHAT_CONTEXT_SIZE: usize = 1_048_576;
 const DEFAULT_CHAT_CONTEXT_TOP_K: usize = 10;
 /// 与 Rust 原生搜索的公开上限一致，防止服务端上下文接口被异常大候选数拖垮。
 const MAX_CHAT_CONTEXT_TOP_K: usize = 50;
+/// 单次资源范围过滤最多接受的来源路径数量。
+///
+/// 这是 privileged server-only 边界上的硬上限：即使调用方被错误配置，也不能通过
+/// 超大 allowlist 放大请求解析、规范化和逐候选匹配成本。
+const MAX_ALLOWED_SOURCE_PATHS: usize = 256;
+/// 单个项目相对来源路径的最大字符数。
+///
+/// 这里按 Unicode 字符计数而不是字节计数，既能稳定限制用户可见路径长度，也避免把
+/// 合法中文文件名按 UTF-8 字节数过度惩罚。
+const MAX_ALLOWED_SOURCE_PATH_CHARS: usize = 1_024;
 const APP_STATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Hybrid retrieval keeps at least this many `raw/sources` hits when available.
 const HYBRID_SOURCES_FLOOR: usize = 2;
@@ -70,6 +80,13 @@ struct ChatContextRequest {
     /// Aliases: `faithful`/`sources` → sources_only; `all` → hybrid.
     #[serde(default)]
     retrieval_mode: Option<String>,
+    /// 可选的项目相对来源路径 allowlist。
+    ///
+    /// 缺省时保持旧客户端的全库检索行为；一旦提供，候选必须先通过精确路径匹配，
+    /// 才能进入排序和上下文装箱。校验与规范化在 privileged 边界统一完成，调用方
+    /// 不能借绝对路径或目录穿越扩大 Wiki Core 的可见范围。
+    #[serde(default)]
+    allowed_source_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +123,180 @@ fn scan_roots_for_mode(mode: RetrievalMode) -> Vec<String> {
         RetrievalMode::SourcesOnly => vec!["raw/sources".to_string()],
         RetrievalMode::Hybrid => vec!["wiki".to_string(), "raw/sources".to_string()],
     }
+}
+
+/// 校验并规范化调用方提供的来源路径 allowlist。
+///
+/// 安全边界说明：这里只接受项目内的相对文件路径，不接受空列表、空项、绝对路径、
+/// Windows 盘符、控制字符以及 `.` / `..` 组件。反斜杠统一成 `/`，使 Windows 风格
+/// 调用方与 Core 返回的项目相对路径使用同一个比较空间。返回 `BTreeSet` 同时去重，
+/// 避免重复项放大后续匹配成本。
+fn normalize_allowed_source_paths(
+    requested: Option<&[String]>,
+) -> Result<Option<BTreeSet<String>>, &'static str> {
+    let Some(paths) = requested else {
+        // 字段省略是明确的向后兼容路径：保持现有全库候选行为。
+        return Ok(None);
+    };
+    if paths.is_empty() {
+        return Err("allowed_source_paths must not be empty when provided");
+    }
+    if paths.len() > MAX_ALLOWED_SOURCE_PATHS {
+        return Err("allowed_source_paths contains too many entries");
+    }
+
+    let mut normalized = BTreeSet::new();
+    for path in paths {
+        normalized.insert(normalize_project_relative_source_path(path)?);
+    }
+    Ok(Some(normalized))
+}
+
+/// 把单个来源路径收敛为可用于精确 allowlist 比较的项目相对路径。
+fn normalize_project_relative_source_path(raw: &str) -> Result<String, &'static str> {
+    if raw.trim().is_empty() {
+        return Err("allowed source path must not be empty");
+    }
+    if raw.chars().count() > MAX_ALLOWED_SOURCE_PATH_CHARS {
+        return Err("allowed source path is too long");
+    }
+    if raw.chars().any(char::is_control) {
+        // NUL 以及换行等控制字符都可能造成跨语言解析或日志边界歧义，统一拒绝。
+        return Err("allowed source path contains control characters");
+    }
+
+    let slash_normalized = raw.replace('\\', "/");
+    if slash_normalized.starts_with('/') {
+        return Err("allowed source path must be project-relative");
+    }
+    let bytes = slash_normalized.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        // 在 Unix 上 `C:/...` 会被 Path 误判为相对路径，因此显式拦截 Windows 盘符。
+        return Err("allowed source path must not contain a drive prefix");
+    }
+
+    let mut components = Vec::new();
+    for component in slash_normalized.split('/') {
+        if component.is_empty() {
+            // 不接受重复或尾随分隔符，防止同一路径出现多个非规范表示。
+            return Err("allowed source path contains an empty component");
+        }
+        if component == "." || component == ".." {
+            return Err("allowed source path contains traversal components");
+        }
+        components.push(component);
+    }
+    Ok(components.join("/"))
+}
+
+/// 计算一次 chat-context 请求真正交给 Core 搜索器的扫描根。
+///
+/// 设计取舍：未提供 allowlist 时继续返回检索模式的历史根目录，完整保持旧行为；提供
+/// allowlist 时则只保留同时属于当前检索模式的精确资源路径。搜索器会先扫描这些路径，
+/// 再在这个受限候选集合上执行 BM25 / Vector / Graph / Hybrid 排序和 top-k，从根源上
+/// 避免“先全库截断、后过滤”把合法资源错误排出候选。
+///
+/// 若二者没有交集，本函数返回空集合。调用方必须直接返回 EMPTY_CONTEXT，不能把空
+/// roots 交给 `search_project_inner`；后者为了兼容旧客户端会把空 roots 回退成 `wiki`，
+/// 在显式资源范围下那会造成意外的全库扫描。
+fn resolve_chat_context_scan_roots(
+    mode: RetrievalMode,
+    allowed_paths: Option<&BTreeSet<String>>,
+) -> Vec<String> {
+    let mode_roots = scan_roots_for_mode(mode);
+    let Some(allowed_paths) = allowed_paths else {
+        return mode_roots;
+    };
+
+    allowed_paths
+        .iter()
+        .filter(|path| {
+            mode_roots.iter().any(|root| {
+                path.as_str() == root
+                    || path
+                        .strip_prefix(root)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// 显式资源范围经过文件系统安全边界校验后的不可变投影。
+///
+/// allowlist 省略时保留调用方原始项目路径，避免改变旧项目通过路径别名打开的行为；
+/// 显式范围则固定到 canonical 项目根和 canonical 项目相对普通文件，供后续扫描复用。
+struct ValidatedSourceFileScope {
+    project_root: String,
+    allowed_paths: Option<BTreeSet<String>>,
+}
+
+/// 在调用搜索前，把显式 allowlist 收敛为 canonical 项目根内的普通文件集合。
+///
+/// 安全规则：项目根本身、任意中间组件和最终文件都不能是 symlink；最终目标必须存在、
+/// 是普通文件，且 canonical 结果仍位于 canonical 项目根之下。搜索阶段收到的是 canonical
+/// 根与 canonical 相对路径，随后仍由 `WalkDir` 的不跟随 symlink 行为及后置精确过滤提供
+/// 纵深防御。所有错误均返回稳定分类，不包含调用方路径或系统错误正文。
+fn validate_allowed_source_files(
+    project_root: &str,
+    allowed_paths: Option<BTreeSet<String>>,
+) -> Result<ValidatedSourceFileScope, &'static str> {
+    let Some(allowed_paths) = allowed_paths else {
+        return Ok(ValidatedSourceFileScope {
+            project_root: project_root.to_string(),
+            allowed_paths: None,
+        });
+    };
+
+    let root_path = Path::new(project_root);
+    let root_metadata = fs::symlink_metadata(root_path)
+        .map_err(|_| "project root is unavailable for source scope validation")?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err("project root must be a real directory for explicit source scope");
+    }
+    let canonical_root = fs::canonicalize(root_path)
+        .map_err(|_| "project root cannot be canonicalized for source scope validation")?;
+
+    let mut validated = BTreeSet::new();
+    for allowed_path in allowed_paths {
+        let components = allowed_path.split('/').collect::<Vec<_>>();
+        let mut candidate = canonical_root.clone();
+        for (index, component) in components.iter().enumerate() {
+            candidate.push(component);
+            let metadata = fs::symlink_metadata(&candidate)
+                .map_err(|_| "allowed source path must exist as a regular file")?;
+            if metadata.file_type().is_symlink() {
+                return Err("allowed source path must not contain symlinks");
+            }
+            let is_last = index + 1 == components.len();
+            if is_last {
+                if !metadata.is_file() {
+                    return Err("allowed source path must reference a regular file");
+                }
+            } else if !metadata.is_dir() {
+                return Err("allowed source path parent must be a real directory");
+            }
+        }
+
+        let canonical_target = fs::canonicalize(&candidate)
+            .map_err(|_| "allowed source path cannot be canonicalized")?;
+        let relative = canonical_target
+            .strip_prefix(&canonical_root)
+            .map_err(|_| "allowed source path must remain inside the project root")?;
+        let relative = relative
+            .to_str()
+            .ok_or("allowed source path must be valid UTF-8")?
+            .replace('\\', "/");
+        validated.insert(normalize_project_relative_source_path(&relative)?);
+    }
+
+    Ok(ValidatedSourceFileScope {
+        project_root: canonical_root
+            .to_str()
+            .ok_or("canonical project root must be valid UTF-8")?
+            .to_string(),
+        allowed_paths: Some(validated),
+    })
 }
 
 struct ContextBudget {
@@ -1050,6 +1241,21 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
             "max_block_chars must be greater than zero",
         );
     }
+    let normalized_allowed_source_paths =
+        match normalize_allowed_source_paths(request.allowed_source_paths.as_deref()) {
+            Ok(paths) => paths,
+            Err(message) => {
+                return error_response(400, "INVALID_ALLOWED_SOURCE_PATHS", message);
+            }
+        };
+    let validated_source_scope =
+        match validate_allowed_source_files(&project.path, normalized_allowed_source_paths) {
+            Ok(scope) => scope,
+            Err(message) => {
+                return error_response(400, "INVALID_ALLOWED_SOURCE_PATHS", message);
+            }
+        };
+    let allowed_source_paths = validated_source_scope.allowed_paths;
 
     let budget = compute_context_budget(request.max_context_size);
     let effective_max_block_chars =
@@ -1059,8 +1265,33 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
         .unwrap_or(DEFAULT_CHAT_CONTEXT_TOP_K)
         .clamp(1, MAX_CHAT_CONTEXT_TOP_K);
     let retrieval_mode = parse_retrieval_mode(request.retrieval_mode.as_deref());
-    let scan_roots = scan_roots_for_mode(retrieval_mode);
+    let mode_scan_roots = scan_roots_for_mode(retrieval_mode);
+    let scan_roots = resolve_chat_context_scan_roots(retrieval_mode, allowed_source_paths.as_ref());
     let mode_label = retrieval_mode_label(retrieval_mode);
+    let response_context = ChatContextResponseContext {
+        project_id,
+        request: &request,
+        budget: &budget,
+        effective_max_block_chars,
+        mode_label,
+        mode_scan_roots: &mode_scan_roots,
+    };
+
+    if scan_roots.is_empty() {
+        // 显式 allowlist 与 retrieval mode 没有交集时必须在搜索前失败关闭。不能把空
+        // roots 传给 Core 搜索器，因为其旧兼容合同会把空值回退为默认 wiki 全库。
+        return response_context.build(
+            Vec::new(),
+            Vec::new(),
+            SourceFilterStats {
+                active: true,
+                allowed_count: allowed_source_paths.as_ref().map_or(0, BTreeSet::len),
+                candidate_count: 0,
+                matched_count: 0,
+            },
+            None,
+        );
+    }
 
     // Perform real search (context assembly only — no final reply generation).
     let embedding_config = load_embedding_config();
@@ -1078,60 +1309,165 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
         }
     };
 
-    let search = match tauri::async_runtime::block_on(commands::search::search_project_inner(
-        project.path.clone(),
-        request.query.clone(),
-        top_k,
-        true, // include_content
-        query_embedding,
-        Some(scan_roots.clone()),
-    )) {
+    let search_result = if allowed_source_paths.is_some() {
+        tauri::async_runtime::block_on(commands::search::search_project_scoped_inner(
+            validated_source_scope.project_root,
+            request.query.clone(),
+            top_k,
+            true, // include_content
+            query_embedding,
+            scan_roots.clone(),
+        ))
+    } else {
+        // allowlist 省略时继续走历史搜索入口，向量查询保持全项目行为。
+        tauri::async_runtime::block_on(commands::search::search_project_inner(
+            validated_source_scope.project_root,
+            request.query.clone(),
+            top_k,
+            true,
+            query_embedding,
+            Some(scan_roots.clone()),
+        ))
+    };
+    let search = match search_result {
         Ok(res) => res,
         Err(error) => return retrieval_failed_response(&error),
     };
 
-    let ordered = order_results_for_context(retrieval_mode, search.results);
+    // 资源范围过滤必须发生在混合模式重排与上下文装箱之前。这样无论候选来自
+    // BM25、Vector、Graph 还是 RRF，都没有未授权候选借排序或预算分支进入 Prompt。
+    // 当 allowlist 已提供但没有任何精确匹配时，`filtered_results` 保持为空；后续会
+    // 返回合法 EMPTY_CONTEXT，绝不为了“有答案”而放宽回全库。
+    let (filtered_results, source_filter_stats) =
+        filter_results_by_allowed_source_paths(search.results, allowed_source_paths.as_ref());
+    let ordered = order_results_for_context(retrieval_mode, filtered_results);
     let (context_blocks, references) =
         assemble_context_blocks(ordered, &budget, effective_max_block_chars);
 
-    let status = if context_blocks.is_empty() {
-        "EMPTY_CONTEXT"
-    } else {
-        "SUCCESS"
+    response_context.build(
+        context_blocks,
+        references,
+        source_filter_stats,
+        Some(RetrievalSearchStats {
+            search_mode: search.mode.as_str(),
+            vector_hits: search.vector_hits,
+            token_hits: search.token_hits,
+            graph_hits: search.graph_hits,
+        }),
+    )
+}
+
+/// 统一构造 chat-context 的成功或合法空上下文响应。
+///
+/// 正常搜索与“模式不兼容、搜索前失败关闭”共用这一窄函数，保证二者的状态、预算、
+/// references 和诊断信封完全一致，避免早返回分支复制协议字段后逐渐漂移。
+struct ChatContextResponseContext<'a> {
+    project_id: &'a str,
+    request: &'a ChatContextRequest,
+    budget: &'a ContextBudget,
+    effective_max_block_chars: Option<usize>,
+    mode_label: &'a str,
+    /// 仅保存模式级安全根用于诊断，不能放入具体 allowlist 文件路径。
+    mode_scan_roots: &'a [String],
+}
+
+impl ChatContextResponseContext<'_> {
+    fn build(
+        &self,
+        context_blocks: Vec<Value>,
+        references: Vec<Value>,
+        source_filter_stats: SourceFilterStats,
+        search_stats: Option<RetrievalSearchStats<'_>>,
+    ) -> OmnimindResponse {
+        let status = if context_blocks.is_empty() {
+            "EMPTY_CONTEXT"
+        } else {
+            "SUCCESS"
+        };
+        let result_count = context_blocks.len();
+
+        OmnimindResponse {
+            status: 200,
+            body: json!({
+                "ok": true,
+                "status": status,
+                "project_id": self.project_id,
+                "query": self.request.query,
+                "context_blocks": context_blocks,
+                "references": references,
+                "budget": {
+                    "max_ctx": self.budget.max_ctx,
+                    "response_reserve": self.budget.response_reserve,
+                    "index_budget": self.budget.index_budget,
+                    "page_budget": self.budget.page_budget,
+                    "max_page_size": self.budget.max_page_size,
+                    "max_block_chars": self.effective_max_block_chars,
+                },
+                "retrieval_debug": build_retrieval_debug(
+                    self.request,
+                    self.mode_label,
+                    self.mode_scan_roots,
+                    result_count,
+                    self.effective_max_block_chars,
+                    source_filter_stats,
+                    search_stats,
+                ),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceFilterStats {
+    active: bool,
+    allowed_count: usize,
+    candidate_count: usize,
+    matched_count: usize,
+}
+
+/// 按规范化后的项目相对路径精确过滤检索候选。
+///
+/// `None` 表示旧客户端省略字段，因此原样保留全部候选；`Some` 表示调用方明确启用
+/// 资源范围，即使没有匹配也返回空集合。候选路径若不符合相同的安全规范，启用过滤
+/// 时会被 fail-closed 排除，而不是尝试猜测或前缀匹配。
+fn filter_results_by_allowed_source_paths(
+    results: Vec<commands::search::ProjectSearchResult>,
+    allowed_paths: Option<&BTreeSet<String>>,
+) -> (
+    Vec<commands::search::ProjectSearchResult>,
+    SourceFilterStats,
+) {
+    let candidate_count = results.len();
+    let Some(allowed_paths) = allowed_paths else {
+        return (
+            results,
+            SourceFilterStats {
+                active: false,
+                allowed_count: 0,
+                candidate_count,
+                matched_count: candidate_count,
+            },
+        );
     };
 
-    OmnimindResponse {
-        status: 200,
-        body: json!({
-            "ok": true,
-            "status": status,
-            "project_id": project_id,
-            "query": request.query,
-            "context_blocks": context_blocks,
-            "references": references,
-            "budget": {
-                "max_ctx": budget.max_ctx,
-                "response_reserve": budget.response_reserve,
-                "index_budget": budget.index_budget,
-                "page_budget": budget.page_budget,
-                "max_page_size": budget.max_page_size,
-                "max_block_chars": effective_max_block_chars,
-            },
-            "retrieval_debug": build_retrieval_debug(
-                &request,
-                mode_label,
-                &scan_roots,
-                context_blocks.len(),
-                effective_max_block_chars,
-                Some(RetrievalSearchStats {
-                    search_mode: search.mode.as_str(),
-                    vector_hits: search.vector_hits,
-                    token_hits: search.token_hits,
-                    graph_hits: search.graph_hits,
-                }),
-            ),
-        }),
-    }
+    let filtered = results
+        .into_iter()
+        .filter(|result| {
+            normalize_project_relative_source_path(&result.path)
+                .map(|path| allowed_paths.contains(&path))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let matched_count = filtered.len();
+    (
+        filtered,
+        SourceFilterStats {
+            active: true,
+            allowed_count: allowed_paths.len(),
+            candidate_count,
+            matched_count,
+        },
+    )
 }
 
 /// True when a search hit path belongs to the raw sources tree.
@@ -1325,12 +1661,17 @@ fn build_retrieval_debug(
     scan_roots: &[String],
     result_count: usize,
     effective_max_block_chars: Option<usize>,
+    source_filter_stats: SourceFilterStats,
     search_stats: Option<RetrievalSearchStats<'_>>,
 ) -> Value {
-    // Always surface retrieval_mode for ops; expand when include_debug=true.
+    // 即使调用方没有开启详细 debug，也公开过滤是否生效，便于上层区分“全库空召回”
+    // 与“资源范围内空召回”。只公开计数和布尔值，不把 allowlist 路径复制进诊断响应。
     if !request.include_debug {
         return json!({
             "retrieval_mode": retrieval_mode,
+            "source_filter_active": source_filter_stats.active,
+            "source_filter_allowed_count": source_filter_stats.allowed_count,
+            "source_filter_matched_count": source_filter_stats.matched_count,
         });
     }
 
@@ -1347,6 +1688,11 @@ fn build_retrieval_debug(
         "effective_max_context_size": compute_context_budget(request.max_context_size).max_ctx,
         "requested_max_block_chars": request.max_block_chars,
         "effective_max_block_chars": effective_max_block_chars,
+        "source_filter_active": source_filter_stats.active,
+        "source_filter_allowed_count": source_filter_stats.allowed_count,
+        "source_filter_candidate_count": source_filter_stats.candidate_count,
+        "source_filter_matched_count": source_filter_stats.matched_count,
+        "source_filter_excluded_count": source_filter_stats.candidate_count.saturating_sub(source_filter_stats.matched_count),
     });
 
     if let Some(stats) = search_stats {
@@ -1362,10 +1708,40 @@ fn build_retrieval_debug(
 }
 
 /// 检索失败与真实空召回必须使用不同的稳定信封。
-/// 内部错误只写入服务端 stderr，响应不回显文件内容、绝对路径或 Provider 原始异常。
+/// 响应与 stderr 都不能回显文件内容、绝对路径或 Provider 原始异常。
 fn retrieval_failed_response(internal_error: &str) -> OmnimindResponse {
-    eprintln!("[OmniMind Server] chat-context retrieval failed: {internal_error}");
+    eprintln!("{}", safe_retrieval_log_line(internal_error));
     error_response(502, "RETRIEVAL_FAILED", "Knowledge retrieval failed")
+}
+
+/// 将任意内部错误投影为有限、稳定且不含原文的安全日志行。
+///
+/// 原始错误只参与内存中的类别判断，绝不拼接进返回值。这样即使底层错误包含绝对路径、
+/// 租户文件名、供应商正文或凭据片段，stderr 也只会出现稳定原因码和安全分类。
+fn safe_retrieval_log_line(internal_error: &str) -> String {
+    // 分类最多查看前 4096 个字符；供应商若返回异常大的正文，也不能让日志分类阶段
+    // 复制整段响应。截断内容仅驻留在本函数内，仍不会进入最终日志。
+    let lower = internal_error
+        .chars()
+        .take(4_096)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let category = if lower.contains("embedding") || lower.contains("provider") {
+        "provider_or_embedding"
+    } else if lower.contains("vector") || lower.contains("lance") {
+        "vector_store"
+    } else if lower.contains("scan")
+        || lower.contains("file")
+        || lower.contains("path")
+        || lower.contains("permission")
+    {
+        "project_io"
+    } else {
+        "internal"
+    };
+    format!(
+        "[OmniMind Server] chat-context retrieval failed code=RETRIEVAL_FAILED category={category}"
+    )
 }
 
 fn error_response(status: u16, code: &str, message: &str) -> OmnimindResponse {
@@ -2441,6 +2817,13 @@ mod tests {
             output_language: None,
             include_debug: false,
             retrieval_mode: Some("sources_only".into()),
+            allowed_source_paths: None,
+        };
+        let inactive_filter = SourceFilterStats {
+            active: false,
+            allowed_count: 0,
+            candidate_count: 0,
+            matched_count: 0,
         };
         let compact = build_retrieval_debug(
             &request,
@@ -2448,9 +2831,13 @@ mod tests {
             &["raw/sources".into()],
             0,
             None,
+            inactive_filter,
             None,
         );
         assert_eq!(compact["retrieval_mode"], "sources_only");
+        assert_eq!(compact["source_filter_active"], false);
+        assert_eq!(compact["source_filter_allowed_count"], 0);
+        assert_eq!(compact["source_filter_matched_count"], 0);
         assert!(compact.get("scan_roots").is_none());
         assert!(compact.get("search_mode").is_none());
 
@@ -2464,6 +2851,12 @@ mod tests {
             &["raw/sources".into()],
             3,
             None,
+            SourceFilterStats {
+                active: true,
+                allowed_count: 2,
+                candidate_count: 5,
+                matched_count: 3,
+            },
             Some(RetrievalSearchStats {
                 search_mode: "hybrid",
                 vector_hits: 4,
@@ -2479,6 +2872,15 @@ mod tests {
         assert_eq!(full["vector_hits"], 4);
         assert_eq!(full["token_hits"], 7);
         assert_eq!(full["graph_hits"], 1);
+        assert_eq!(full["source_filter_active"], true);
+        assert_eq!(full["source_filter_allowed_count"], 2);
+        assert_eq!(full["source_filter_candidate_count"], 5);
+        assert_eq!(full["source_filter_matched_count"], 3);
+        assert_eq!(full["source_filter_excluded_count"], 2);
+        assert!(
+            !full.to_string().contains("raw/sources/private.md"),
+            "过滤诊断不得回显 allowlist 中的具体来源路径"
+        );
     }
 
     #[test]
@@ -2615,7 +3017,367 @@ mod tests {
         assert_eq!(request.query_embedding, None);
         assert_eq!(request.top_k, None);
         assert_eq!(request.max_block_chars, None);
+        assert_eq!(request.allowed_source_paths, None);
         assert_eq!(DEFAULT_CHAT_CONTEXT_TOP_K, 10);
+
+        // 不仅反序列化合同保持兼容，省略字段时也必须完整保留旧有候选集合。
+        let results = vec![
+            sample_result("wiki/a.md", "A", 0.9),
+            sample_result("raw/sources/b.md", "B", 0.8),
+        ];
+        let allowed = normalize_allowed_source_paths(request.allowed_source_paths.as_deref())
+            .expect("省略字段不应产生校验错误");
+        let (unfiltered, stats) = filter_results_by_allowed_source_paths(results, allowed.as_ref());
+        assert_eq!(unfiltered.len(), 2);
+        assert!(!stats.active);
+        assert_eq!(stats.matched_count, 2);
+    }
+
+    #[test]
+    fn allowed_source_paths_normalize_separators_and_deduplicate() {
+        let requested = vec![
+            "raw\\sources\\门店资料.md".to_string(),
+            "raw/sources/门店资料.md".to_string(),
+        ];
+
+        let normalized = normalize_allowed_source_paths(Some(&requested))
+            .unwrap()
+            .expect("显式 allowlist 应保持启用状态");
+
+        assert_eq!(normalized.len(), 1);
+        assert!(normalized.contains("raw/sources/门店资料.md"));
+    }
+
+    #[test]
+    fn allowed_source_paths_become_exact_mode_compatible_scan_roots() {
+        let requested = vec![
+            "raw/sources/产品资料.md".to_string(),
+            "raw/sources/服务说明.md".to_string(),
+            "wiki/entities/产品.md".to_string(),
+        ];
+        let allowed = normalize_allowed_source_paths(Some(&requested))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            resolve_chat_context_scan_roots(RetrievalMode::SourcesOnly, Some(&allowed)),
+            vec!["raw/sources/产品资料.md", "raw/sources/服务说明.md"]
+        );
+        assert_eq!(
+            resolve_chat_context_scan_roots(RetrievalMode::Wiki, Some(&allowed)),
+            vec!["wiki/entities/产品.md"]
+        );
+        assert_eq!(
+            resolve_chat_context_scan_roots(RetrievalMode::Hybrid, Some(&allowed)),
+            vec![
+                "raw/sources/产品资料.md",
+                "raw/sources/服务说明.md",
+                "wiki/entities/产品.md",
+            ]
+        );
+
+        // 省略 allowlist 时必须继续使用模式历史根，而不是收窄或改变默认行为。
+        assert_eq!(
+            resolve_chat_context_scan_roots(RetrievalMode::Wiki, None),
+            vec!["wiki"]
+        );
+    }
+
+    #[test]
+    fn incompatible_allowed_paths_fail_closed_before_search() {
+        let requested = vec!["raw/sources/仅原始资料.md".to_string()];
+        let allowed = normalize_allowed_source_paths(Some(&requested))
+            .unwrap()
+            .unwrap();
+        let roots = resolve_chat_context_scan_roots(RetrievalMode::Wiki, Some(&allowed));
+        assert!(roots.is_empty(), "wiki 模式不得扫描 raw/sources allowlist");
+
+        let request: ChatContextRequest = serde_json::from_str(
+            r#"{"query":"q","include_debug":true,"retrieval_mode":"wiki","allowed_source_paths":["raw/sources/仅原始资料.md"]}"#,
+        )
+        .unwrap();
+        let budget = compute_context_budget(None);
+        let mode_roots = vec!["wiki".to_string()];
+        let response_context = ChatContextResponseContext {
+            project_id: "project-1",
+            request: &request,
+            budget: &budget,
+            effective_max_block_chars: None,
+            mode_label: "wiki",
+            mode_scan_roots: &mode_roots,
+        };
+        let response = response_context.build(
+            Vec::new(),
+            Vec::new(),
+            SourceFilterStats {
+                active: true,
+                allowed_count: 1,
+                candidate_count: 0,
+                matched_count: 0,
+            },
+            None,
+        );
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["status"], "EMPTY_CONTEXT");
+        assert_eq!(response.body["context_blocks"], json!([]));
+        assert_eq!(response.body["references"], json!([]));
+        assert_eq!(
+            response.body["retrieval_debug"]["source_filter_active"],
+            true
+        );
+        assert_eq!(
+            response.body["retrieval_debug"]["source_filter_candidate_count"],
+            0
+        );
+        assert_eq!(
+            response.body["retrieval_debug"]["scan_roots"],
+            json!(["wiki"])
+        );
+        assert!(
+            !response.body.to_string().contains("仅原始资料.md"),
+            "失败关闭诊断不得回显具体 allowlist 路径"
+        );
+    }
+
+    #[test]
+    fn scoped_scan_finds_full_omniflux_question_even_when_global_top_twenty_excludes_target() {
+        let root = test_dir("allowed-source-top-k");
+        let sources = root.join("raw/sources");
+        fs::create_dir_all(&sources).unwrap();
+
+        let query = "OmniFlux Pro 的自清洁功能适合哪些使用场景？使用时有哪些注意事项？请根据知识库回答并标注引用。";
+        let target_relative = "raw/sources/omniflux-pro.md";
+        fs::write(
+            root.join(target_relative),
+            "# OmniFlux Pro 自清洁功能\n\n适合连续运行和粉尘较多的使用场景。注意事项：维护前断电，并按周期检查集尘组件。\n",
+        )
+        .unwrap();
+
+        // 构造 24 个全局分数更高的干扰文件，稳定复现“目标资源排在全库 top20 外”。
+        // 修复前先全库 top-k 再过滤会得到 EMPTY_CONTEXT；修复后扫描根就是目标文件，
+        // top-k 只在授权候选内执行，因此完整真实问题仍能命中。
+        for index in 0..24 {
+            fs::write(
+                sources.join(format!("distractor-{index:02}.md")),
+                format!(
+                    "# {query}\n\n{query}\n{query}\n这是用于验证全局排名截断的干扰资料 {index}。\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let project_path = root.to_string_lossy().to_string();
+        let global = tauri::async_runtime::block_on(commands::search::search_project_inner(
+            project_path.clone(),
+            query.to_string(),
+            20,
+            true,
+            None,
+            Some(vec!["raw/sources".to_string()]),
+        ))
+        .unwrap();
+        assert_eq!(global.results.len(), 20);
+        assert!(
+            global
+                .results
+                .iter()
+                .all(|item| item.path != target_relative),
+            "测试前置条件必须证明目标资源确实位于全库 top20 之外"
+        );
+
+        let requested = vec![target_relative.to_string()];
+        let allowed = normalize_allowed_source_paths(Some(&requested))
+            .unwrap()
+            .unwrap();
+        let scoped_roots =
+            resolve_chat_context_scan_roots(RetrievalMode::SourcesOnly, Some(&allowed));
+        assert_eq!(scoped_roots, vec![target_relative]);
+
+        let scoped = tauri::async_runtime::block_on(commands::search::search_project_scoped_inner(
+            project_path,
+            query.to_string(),
+            20,
+            true,
+            None,
+            scoped_roots,
+        ))
+        .unwrap();
+        let (filtered, stats) =
+            filter_results_by_allowed_source_paths(scoped.results, Some(&allowed));
+        let budget = compute_context_budget(None);
+        let (blocks, references) = assemble_context_blocks(filtered, &budget, None);
+
+        assert_eq!(stats.candidate_count, 1);
+        assert_eq!(stats.matched_count, 1);
+        assert_eq!(blocks[0]["path"], target_relative);
+        assert_eq!(references[0]["path"], target_relative);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn allowed_source_paths_reject_empty_absolute_traversal_and_control_values() {
+        let invalid_cases = vec![
+            Vec::<String>::new(),
+            vec!["".to_string()],
+            vec!["   ".to_string()],
+            vec!["/private/secret.md".to_string()],
+            vec!["C:\\private\\secret.md".to_string()],
+            vec!["raw/./sources.md".to_string()],
+            vec!["raw/../secret.md".to_string()],
+            vec!["raw//sources.md".to_string()],
+            vec!["raw/sources/secret\0.md".to_string()],
+        ];
+
+        for invalid in invalid_cases {
+            assert!(
+                normalize_allowed_source_paths(Some(&invalid)).is_err(),
+                "危险或非规范来源路径必须在 privileged 边界被拒绝: {invalid:?}"
+            );
+        }
+
+        let too_many = (0..=MAX_ALLOWED_SOURCE_PATHS)
+            .map(|index| format!("raw/sources/{index}.md"))
+            .collect::<Vec<_>>();
+        assert!(normalize_allowed_source_paths(Some(&too_many)).is_err());
+
+        let too_long = vec![format!(
+            "raw/sources/{}.md",
+            "长".repeat(MAX_ALLOWED_SOURCE_PATH_CHARS)
+        )];
+        assert!(normalize_allowed_source_paths(Some(&too_long)).is_err());
+    }
+
+    #[test]
+    fn explicit_source_scope_accepts_only_existing_canonical_regular_files() {
+        let root = test_dir("source-scope-regular-file");
+        let sources = root.join("raw/sources");
+        fs::create_dir_all(&sources).unwrap();
+        fs::write(sources.join("产品资料.md"), "# 产品资料\n").unwrap();
+
+        let allowed = BTreeSet::from(["raw/sources/产品资料.md".to_string()]);
+        let validated =
+            validate_allowed_source_files(root.to_str().unwrap(), Some(allowed)).unwrap();
+
+        assert_eq!(
+            validated.project_root,
+            fs::canonicalize(&root).unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            validated.allowed_paths.unwrap(),
+            BTreeSet::from(["raw/sources/产品资料.md".to_string()])
+        );
+
+        let directory = BTreeSet::from(["raw/sources".to_string()]);
+        assert!(validate_allowed_source_files(root.to_str().unwrap(), Some(directory)).is_err());
+
+        let missing = BTreeSet::from(["raw/sources/不存在.md".to_string()]);
+        assert!(validate_allowed_source_files(root.to_str().unwrap(), Some(missing)).is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_source_scope_rejects_file_directory_root_and_chained_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_dir("source-scope-symlinks");
+        let sources = root.join("raw/sources");
+        fs::create_dir_all(&sources).unwrap();
+        fs::write(sources.join("inside.md"), "inside").unwrap();
+
+        let outside = test_dir("source-scope-outside");
+        fs::write(outside.join("outside.md"), "outside").unwrap();
+
+        symlink("inside.md", sources.join("inside-link.md")).unwrap();
+        symlink(outside.join("outside.md"), sources.join("outside-link.md")).unwrap();
+        symlink(&outside, sources.join("outside-dir-link")).unwrap();
+        symlink("inside-link.md", sources.join("chain-link.md")).unwrap();
+
+        for path in [
+            "raw/sources/inside-link.md",
+            "raw/sources/outside-link.md",
+            "raw/sources/outside-dir-link/outside.md",
+            "raw/sources/chain-link.md",
+        ] {
+            let allowed = BTreeSet::from([path.to_string()]);
+            assert!(
+                validate_allowed_source_files(root.to_str().unwrap(), Some(allowed)).is_err(),
+                "文件、目录或链式 symlink 均不得进入显式扫描范围: {path}"
+            );
+        }
+
+        let root_link = root.with_extension("root-link");
+        let _ = fs::remove_file(&root_link);
+        symlink(&root, &root_link).unwrap();
+        let allowed = BTreeSet::from(["raw/sources/inside.md".to_string()]);
+        assert!(
+            validate_allowed_source_files(root_link.to_str().unwrap(), Some(allowed)).is_err(),
+            "项目根 symlink 必须在 canonical 范围建立前被拒绝"
+        );
+
+        let _ = fs::remove_file(root_link);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn allowed_source_paths_filter_candidates_by_exact_normalized_path() {
+        let requested = vec!["raw\\sources\\allowed.md".to_string()];
+        let allowed = normalize_allowed_source_paths(Some(&requested))
+            .unwrap()
+            .unwrap();
+        let mut allowed_result = sample_result("raw/sources/allowed.md", "允许来源", 0.9);
+        allowed_result.vector_score = Some(0.95);
+        allowed_result.graph_score = Some(0.85);
+        allowed_result.rrf_score = Some(0.75);
+        let mut unauthorized_hybrid =
+            sample_result("raw/sources/blocked.md", "未授权混合候选", 99.0);
+        unauthorized_hybrid.vector_score = Some(1.0);
+        unauthorized_hybrid.graph_score = Some(1.0);
+        unauthorized_hybrid.rrf_score = Some(1.0);
+        let results = vec![
+            allowed_result,
+            sample_result("raw/sources/allowed.md.backup", "相似后缀", 0.8),
+            sample_result("raw/sources/sub/allowed.md", "相似文件名", 0.7),
+            sample_result("wiki/allowed.md", "不同目录", 0.6),
+            unauthorized_hybrid,
+        ];
+
+        let (filtered, stats) = filter_results_by_allowed_source_paths(results, Some(&allowed));
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].path, "raw/sources/allowed.md");
+        assert_eq!(filtered[0].vector_score, Some(0.95));
+        assert_eq!(filtered[0].graph_score, Some(0.85));
+        assert_eq!(filtered[0].rrf_score, Some(0.75));
+        assert_eq!(stats.allowed_count, 1);
+        assert_eq!(stats.candidate_count, 5);
+        assert_eq!(stats.matched_count, 1);
+    }
+
+    #[test]
+    fn unmatched_allowed_source_paths_return_empty_context_without_global_fallback() {
+        let requested = vec!["raw/sources/not-found.md".to_string()];
+        let allowed = normalize_allowed_source_paths(Some(&requested))
+            .unwrap()
+            .unwrap();
+        let results = vec![sample_result(
+            "raw/sources/other.md",
+            "全库中存在但未授权的来源",
+            0.9,
+        )];
+
+        let (filtered, stats) = filter_results_by_allowed_source_paths(results, Some(&allowed));
+        let budget = compute_context_budget(None);
+        let (blocks, references) = assemble_context_blocks(filtered, &budget, None);
+
+        assert!(stats.active);
+        assert_eq!(stats.matched_count, 0);
+        assert!(blocks.is_empty(), "未命中时不得把全库候选装入上下文");
+        assert!(references.is_empty(), "未命中时不得泄漏全库引用");
     }
 
     #[test]
@@ -2748,7 +3510,9 @@ mod tests {
 
     #[test]
     fn retrieval_failure_uses_non_2xx_stable_envelope_without_internal_details() {
-        let response = retrieval_failed_response("/private/workspace/secret.md: permission denied");
+        let raw_error = "/private/workspace/secret.md: permission denied; provider body=sk-secret";
+        let safe_log = safe_retrieval_log_line(raw_error);
+        let response = retrieval_failed_response(raw_error);
 
         assert_eq!(response.status, 502);
         assert_eq!(response.body["ok"], false);
@@ -2759,6 +3523,22 @@ mod tests {
         );
         assert!(!response.body.to_string().contains("secret.md"));
         assert!(!response.body.to_string().contains("permission denied"));
+        assert_eq!(
+            safe_log,
+            "[OmniMind Server] chat-context retrieval failed code=RETRIEVAL_FAILED category=provider_or_embedding"
+        );
+        for forbidden in [
+            "/private/workspace",
+            "secret.md",
+            "permission denied",
+            "provider body",
+            "sk-secret",
+        ] {
+            assert!(
+                !safe_log.contains(forbidden),
+                "安全 stderr 投影不得包含原始错误片段: {forbidden}"
+            );
+        }
     }
 
     #[test]
