@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::{env, process};
@@ -233,10 +234,12 @@ struct ValidatedSourceFileScope {
 
 /// 在调用搜索前，把显式 allowlist 收敛为 canonical 项目根内的普通文件集合。
 ///
-/// 安全规则：项目根本身、任意中间组件和最终文件都不能是 symlink；最终目标必须存在、
-/// 是普通文件，且 canonical 结果仍位于 canonical 项目根之下。搜索阶段收到的是 canonical
-/// 根与 canonical 相对路径，随后仍由 `WalkDir` 的不跟随 symlink 行为及后置精确过滤提供
-/// 纵深防御。所有错误均返回稳定分类，不包含调用方路径或系统错误正文。
+/// 安全规则：项目根本身、任意中间组件和最终文件都不能是 symlink；最终目标必须是普通
+/// 文件，且 canonical 结果仍位于 canonical 项目根之下。调用方保存的同步记录可能晚于
+/// Core 文件清理，因此仅当 `symlink_metadata` 明确返回 `NotFound` 时，把该候选视为当前
+/// 不可用并从结果中剔除；权限、I/O、软链接、非普通文件等情况仍全部失败关闭。搜索阶段
+/// 收到的是 canonical 根与 canonical 相对路径，随后仍由 `WalkDir` 的不跟随 symlink 行为
+/// 及后置精确过滤提供纵深防御。所有错误均返回稳定分类，不包含调用方路径或系统错误正文。
 fn validate_allowed_source_files(
     project_root: &str,
     allowed_paths: Option<BTreeSet<String>>,
@@ -258,13 +261,25 @@ fn validate_allowed_source_files(
         .map_err(|_| "project root cannot be canonicalized for source scope validation")?;
 
     let mut validated = BTreeSet::new();
-    for allowed_path in allowed_paths {
+    'allowed_path: for allowed_path in allowed_paths {
         let components = allowed_path.split('/').collect::<Vec<_>>();
         let mut candidate = canonical_root.clone();
         for (index, component) in components.iter().enumerate() {
             candidate.push(component);
-            let metadata = fs::symlink_metadata(&candidate)
-                .map_err(|_| "allowed source path must exist as a regular file")?;
+            let metadata = match fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    // 路径已经通过纯语法规范化，且逐组件从 canonical 项目根向下构造；
+                    // 因而明确的 NotFound 只表示这条业务记录已经陈旧，不会扩大扫描范围。
+                    // 整条候选直接跳过，绝不能把缺失文件或其父目录回退为全库扫描根。
+                    continue 'allowed_path;
+                }
+                Err(_) => {
+                    // PermissionDenied、循环链接、损坏挂载等异常不能等同于“文件不存在”。
+                    // 若继续搜索会掩盖安全边界状态，因此保持原有 fail-closed 语义。
+                    return Err("allowed source path metadata is unavailable");
+                }
+            };
             if metadata.file_type().is_symlink() {
                 return Err("allowed source path must not contain symlinks");
             }
@@ -3250,13 +3265,16 @@ mod tests {
     }
 
     #[test]
-    fn explicit_source_scope_accepts_only_existing_canonical_regular_files() {
+    fn explicit_source_scope_keeps_existing_files_and_skips_missing_candidates() {
         let root = test_dir("source-scope-regular-file");
         let sources = root.join("raw/sources");
         fs::create_dir_all(&sources).unwrap();
         fs::write(sources.join("产品资料.md"), "# 产品资料\n").unwrap();
 
-        let allowed = BTreeSet::from(["raw/sources/产品资料.md".to_string()]);
+        let allowed = BTreeSet::from([
+            "raw/sources/产品资料.md".to_string(),
+            "raw/sources/已清理资料.md".to_string(),
+        ]);
         let validated =
             validate_allowed_source_files(root.to_str().unwrap(), Some(allowed)).unwrap();
 
@@ -3272,8 +3290,23 @@ mod tests {
         let directory = BTreeSet::from(["raw/sources".to_string()]);
         assert!(validate_allowed_source_files(root.to_str().unwrap(), Some(directory)).is_err());
 
-        let missing = BTreeSet::from(["raw/sources/不存在.md".to_string()]);
-        assert!(validate_allowed_source_files(root.to_str().unwrap(), Some(missing)).is_err());
+        // 全部候选都已缺失时仍必须保留显式 `Some(empty)`，不能降级为 `None`；后续扫描根
+        // 会因此保持空集合并返回 EMPTY_CONTEXT，而不是触发旧客户端的全库兼容分支。
+        let missing = BTreeSet::from([
+            "raw/sources/不存在.md".to_string(),
+            "wiki/父目录也不存在/资料.md".to_string(),
+        ]);
+        let validated_missing =
+            validate_allowed_source_files(root.to_str().unwrap(), Some(missing)).unwrap();
+        let validated_missing_paths = validated_missing
+            .allowed_paths
+            .expect("显式白名单不能被缺失候选转换为未提供白名单");
+        assert!(validated_missing_paths.is_empty());
+        assert!(
+            resolve_chat_context_scan_roots(RetrievalMode::Hybrid, Some(&validated_missing_paths))
+                .is_empty(),
+            "全缺失候选必须保持空扫描根，禁止回退全库"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
