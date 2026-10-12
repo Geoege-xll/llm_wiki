@@ -4,7 +4,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use calamine::{open_workbook_auto, Data, Reader};
+pub mod canonical_source;
 use office_oxide::Document;
 
 use crate::commands::file_sync;
@@ -1000,83 +1000,8 @@ fn extract_pptx_markdown(archive: &mut zip::ZipArchive<fs::File>) -> Result<Stri
 
 /// Extract spreadsheet to Markdown using calamine (supports xlsx, xls, ods).
 fn extract_spreadsheet(path: &str) -> Result<String, String> {
-    let mut workbook = open_workbook_auto(path)
-        .map_err(|e| format!("Failed to open spreadsheet '{}': {}", path, e))?;
-
-    let mut result = String::new();
-    let sheet_names = workbook.sheet_names().to_vec();
-
-    for sheet_name in &sheet_names {
-        if let Ok(range) = workbook.worksheet_range(sheet_name) {
-            if range.is_empty() {
-                continue;
-            }
-
-            if sheet_names.len() > 1 {
-                result.push_str(&format!("## {}\n\n", sheet_name));
-            }
-
-            let mut rows: Vec<Vec<String>> = Vec::new();
-            let mut max_cols = 0;
-
-            for row in range.rows() {
-                let cells: Vec<String> = row
-                    .iter()
-                    .map(|cell| match cell {
-                        Data::Empty => String::new(),
-                        Data::String(s) => s.clone(),
-                        Data::Float(f) => {
-                            if *f == (*f as i64) as f64 {
-                                format!("{}", *f as i64)
-                            } else {
-                                format!("{:.2}", f)
-                            }
-                        }
-                        Data::Int(i) => i.to_string(),
-                        Data::Bool(b) => b.to_string(),
-                        Data::DateTime(dt) => format!("{}", dt),
-                        Data::DateTimeIso(s) => s.clone(),
-                        Data::DurationIso(s) => s.clone(),
-                        Data::Error(e) => format!("ERR:{:?}", e),
-                    })
-                    .collect();
-                if cells.len() > max_cols {
-                    max_cols = cells.len();
-                }
-                rows.push(cells);
-            }
-
-            // Skip empty sheets
-            if rows.is_empty() || max_cols == 0 {
-                continue;
-            }
-
-            for (i, row) in rows.iter().enumerate() {
-                let mut padded = row.clone();
-                padded.resize(max_cols, String::new());
-                // Escape pipe characters in cell values
-                let escaped: Vec<String> = padded.iter().map(|c| c.replace('|', "\\|")).collect();
-                result.push_str("| ");
-                result.push_str(&escaped.join(" | "));
-                result.push_str(" |\n");
-
-                if i == 0 {
-                    result.push('|');
-                    for _ in 0..max_cols {
-                        result.push_str(" --- |");
-                    }
-                    result.push('\n');
-                }
-            }
-            result.push('\n');
-        }
-    }
-
-    if result.trim().is_empty() {
-        Ok("[Could not extract data from spreadsheet]".to_string())
-    } else {
-        Ok(result)
-    }
+    // 保真规则集中在 OmniMind 扩展中；保留上游调用入口，避免桌面与服务端提取分叉。
+    canonical_source::extract_spreadsheet(path)
 }
 
 /// Extract OpenDocument format text (basic).

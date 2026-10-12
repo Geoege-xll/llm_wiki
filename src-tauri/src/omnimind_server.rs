@@ -1,3 +1,4 @@
+use crate::commands::fs::canonical_source::{self, SourceHashScope};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
@@ -36,6 +37,39 @@ const MAX_ALLOWED_SOURCE_PATH_CHARS: usize = 1_024;
 const APP_STATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Hybrid retrieval keeps at least this many `raw/sources` hits when available.
 const HYBRID_SOURCES_FLOOR: usize = 2;
+/// Hub 托管 Workspace 在 Wiki Core 数据目录下的固定容器名。
+///
+/// 调用方只提交严格校验后的 Workspace ID，永远不能提交路径；因此所有租户数据都会
+/// 被锚定到 `<wiki-data>/managed-workspaces/<workspace-id>`，不会与桌面端用户项目混放。
+const MANAGED_WORKSPACES_DIR: &str = "managed-workspaces";
+/// 托管 Workspace 的所有标准目录。该清单与桌面端 `create_project` 的知识目录保持一致，
+/// 并额外包含项目身份目录，便于重复 ensure 时做完整性与软链接边界检查。
+const MANAGED_WORKSPACE_REQUIRED_DIRS: &[&str] = &[
+    "raw",
+    "raw/sources",
+    "raw/assets",
+    "wiki",
+    "wiki/entities",
+    "wiki/concepts",
+    "wiki/sources",
+    "wiki/queries",
+    "wiki/comparisons",
+    "wiki/synthesis",
+    ".llm-wiki",
+    ".obsidian",
+];
+/// 桌面端新建项目生成的基础知识文件，以及 server-only 稳定解析所需的项目身份文件。
+const MANAGED_WORKSPACE_REQUIRED_FILES: &[&str] = &[
+    "schema.md",
+    "purpose.md",
+    "wiki/index.md",
+    "wiki/log.md",
+    "wiki/overview.md",
+    ".llm-wiki/project.json",
+    ".obsidian/app.json",
+    ".obsidian/appearance.json",
+    ".obsidian/core-plugins.json",
+];
 
 pub struct OmnimindResponse {
     status: u16,
@@ -88,6 +122,9 @@ struct ChatContextRequest {
     /// 不能借绝对路径或目录穿越扩大 Wiki Core 的可见范围。
     #[serde(default)]
     allowed_source_paths: Option<Vec<String>>,
+    /// 宿主签发的精确来源字节版本；省略时保留旧客户端合同。
+    #[serde(default)]
+    allowed_source_hashes: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +365,239 @@ struct ProjectEntry {
     name: String,
     path: String,
     current: bool,
+}
+
+struct ManagedWorkspaceEnsureResult {
+    project: ProjectEntry,
+    created: bool,
+}
+
+/// 只接受“去掉连字符后的租户 UUID”：恰好 32 位小写十六进制。
+///
+/// 这里故意不做 trim、大小写转换或 UUID 宽松解析。HTTP 路径中的任意斜杠、点号、
+/// 百分号、连字符和大写字母都会失败关闭，避免同一租户出现多个路径表示，也杜绝把
+/// 任意相对/绝对路径伪装成 Workspace ID。
+fn is_managed_workspace_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+/// 获取托管 Workspace 根目录，并验证它始终是 Wiki Core 数据目录内的真实目录。
+///
+/// `create=true` 仅供 ensure 使用，会创建尚不存在的数据目录和托管容器；解析已有
+/// Workspace 时传 `false`，从而避免一次只读项目请求产生文件系统副作用。数据目录或
+/// 托管容器若是软链接会直接拒绝，防止本地错误配置把租户资料导向 Wiki 数据目录之外。
+fn managed_workspaces_root(data_dir: &Path, create: bool) -> Result<Option<PathBuf>, &'static str> {
+    if create {
+        fs::create_dir_all(data_dir).map_err(|_| "managed workspace storage is unavailable")?;
+    } else if !data_dir.exists() {
+        return Ok(None);
+    }
+
+    let data_metadata =
+        fs::symlink_metadata(data_dir).map_err(|_| "managed workspace storage is unavailable")?;
+    if data_metadata.file_type().is_symlink() || !data_metadata.is_dir() {
+        return Err("managed workspace storage boundary is invalid");
+    }
+    let canonical_data =
+        fs::canonicalize(data_dir).map_err(|_| "managed workspace storage is unavailable")?;
+
+    let managed_root = data_dir.join(MANAGED_WORKSPACES_DIR);
+    if create {
+        match fs::create_dir(&managed_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(_) => return Err("managed workspace storage is unavailable"),
+        }
+    } else if !managed_root.exists() {
+        return Ok(None);
+    }
+
+    let managed_metadata = fs::symlink_metadata(&managed_root)
+        .map_err(|_| "managed workspace storage is unavailable")?;
+    if managed_metadata.file_type().is_symlink() || !managed_metadata.is_dir() {
+        return Err("managed workspace storage boundary is invalid");
+    }
+    let canonical_managed =
+        fs::canonicalize(&managed_root).map_err(|_| "managed workspace storage is unavailable")?;
+    if !canonical_managed.starts_with(&canonical_data) {
+        return Err("managed workspace storage boundary is invalid");
+    }
+    Ok(Some(canonical_managed))
+}
+
+/// 验证一个已存在的托管 Workspace 是否仍是完整、隔离且可安全解析的项目。
+///
+/// 重复 ensure 不修补、不覆盖既有内容：只有完整目录、完整基础文件和匹配的项目身份
+/// 才算成功。这样既能保证真正的 no-op，也能在磁盘损坏或被替换为软链接时失败关闭。
+fn validate_managed_workspace(
+    managed_root: &Path,
+    workspace_id: &str,
+) -> Result<ProjectEntry, &'static str> {
+    if !is_managed_workspace_id(workspace_id) {
+        return Err("managed workspace id is invalid");
+    }
+
+    let workspace = managed_root.join(workspace_id);
+    let workspace_metadata =
+        fs::symlink_metadata(&workspace).map_err(|_| "managed workspace is unavailable")?;
+    if workspace_metadata.file_type().is_symlink() || !workspace_metadata.is_dir() {
+        return Err("managed workspace boundary is invalid");
+    }
+    let canonical_workspace =
+        fs::canonicalize(&workspace).map_err(|_| "managed workspace is unavailable")?;
+    if !canonical_workspace.starts_with(managed_root) {
+        return Err("managed workspace boundary is invalid");
+    }
+
+    for relative in MANAGED_WORKSPACE_REQUIRED_DIRS {
+        let metadata = fs::symlink_metadata(canonical_workspace.join(relative))
+            .map_err(|_| "managed workspace is incomplete")?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("managed workspace is incomplete");
+        }
+    }
+    for relative in MANAGED_WORKSPACE_REQUIRED_FILES {
+        let metadata = fs::symlink_metadata(canonical_workspace.join(relative))
+            .map_err(|_| "managed workspace is incomplete")?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("managed workspace is incomplete");
+        }
+    }
+
+    let identity_raw = fs::read_to_string(canonical_workspace.join(".llm-wiki/project.json"))
+        .map_err(|_| "managed workspace identity is unavailable")?;
+    let identity: Value =
+        serde_json::from_str(&identity_raw).map_err(|_| "managed workspace identity is invalid")?;
+    if identity.get("id").and_then(Value::as_str) != Some(workspace_id)
+        || identity.get("managedBy").and_then(Value::as_str) != Some("omnimind-hub")
+    {
+        return Err("managed workspace identity is invalid");
+    }
+
+    Ok(ProjectEntry {
+        id: workspace_id.to_string(),
+        name: "OmniMind Managed Workspace".to_string(),
+        path: normalize_path(&canonical_workspace.to_string_lossy()),
+        current: false,
+    })
+}
+
+/// 在指定 Wiki 数据目录内幂等确保一个租户 Workspace。
+///
+/// 首次创建先调用既有 Rust `create_project` 生成完整知识目录，再补充项目身份文件，
+/// 最后通过同一文件系统内的 rename 原子发布。并发 ensure 只有一个请求会发布成功；
+/// 其余请求验证已经发布的目录后按 no-op 返回，不会覆盖任何租户内容。
+fn ensure_managed_workspace_in(
+    data_dir: &Path,
+    workspace_id: &str,
+) -> Result<ManagedWorkspaceEnsureResult, &'static str> {
+    if !is_managed_workspace_id(workspace_id) {
+        return Err("managed workspace id is invalid");
+    }
+    let managed_root = managed_workspaces_root(data_dir, true)?
+        .ok_or("managed workspace storage is unavailable")?;
+    let target = managed_root.join(workspace_id);
+    if target.exists() {
+        return validate_managed_workspace(&managed_root, workspace_id).map(|project| {
+            ManagedWorkspaceEnsureResult {
+                project,
+                created: false,
+            }
+        });
+    }
+
+    // staging 父目录名由进程号、单调计数和时间组成，仅在已验证的 managed 根目录内使用。
+    // 调用方无法影响这个路径；即便两个请求同纳秒到达，计数器也能避免互相覆盖。
+    static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "managed workspace clock is unavailable")?;
+    let nanos = now.as_nanos();
+    let created_at = now.as_millis() as u64;
+    let staging_parent = managed_root.join(format!(".ensure-{}-{nanos}-{sequence}", process::id()));
+    fs::create_dir(&staging_parent).map_err(|_| "managed workspace staging failed")?;
+
+    let staging_parent_string = staging_parent.to_string_lossy().to_string();
+    let staged_project =
+        match commands::project::create_project(workspace_id.to_string(), staging_parent_string) {
+            Ok(project) => PathBuf::from(project.path),
+            Err(_) => {
+                let _ = fs::remove_dir_all(&staging_parent);
+                return Err("managed workspace initialization failed");
+            }
+        };
+
+    let identity_dir = staged_project.join(".llm-wiki");
+    if fs::create_dir(&identity_dir).is_err() {
+        let _ = fs::remove_dir_all(&staging_parent);
+        return Err("managed workspace identity initialization failed");
+    }
+    let identity = match serde_json::to_vec_pretty(&json!({
+        "id": workspace_id,
+        "createdAt": created_at,
+        "managedBy": "omnimind-hub",
+    })) {
+        Ok(identity) => identity,
+        Err(_) => {
+            let _ = fs::remove_dir_all(&staging_parent);
+            return Err("managed workspace identity initialization failed");
+        }
+    };
+    if fs::write(identity_dir.join("project.json"), identity).is_err() {
+        let _ = fs::remove_dir_all(&staging_parent);
+        return Err("managed workspace identity initialization failed");
+    }
+
+    match fs::rename(&staged_project, &target) {
+        Ok(()) => {
+            let _ = fs::remove_dir(&staging_parent);
+            validate_managed_workspace(&managed_root, workspace_id).map(|project| {
+                ManagedWorkspaceEnsureResult {
+                    project,
+                    created: true,
+                }
+            })
+        }
+        Err(_) if target.exists() => {
+            // 另一个并发请求已率先发布同一租户目录；丢弃本请求尚未公开的 staging，
+            // 并严格验证胜出目录，而不是把 rename 失败误报为创建成功。
+            let _ = fs::remove_dir_all(&staging_parent);
+            validate_managed_workspace(&managed_root, workspace_id).map(|project| {
+                ManagedWorkspaceEnsureResult {
+                    project,
+                    created: false,
+                }
+            })
+        }
+        Err(_) => {
+            let _ = fs::remove_dir_all(&staging_parent);
+            Err("managed workspace publish failed")
+        }
+    }
+}
+
+/// 解析已经由 Hub ensure 的租户 Workspace。无效 ID 或尚未创建的目录返回 `None`，
+/// 损坏、软链接或越界目录则返回稳定分类，绝不回退到其他租户或桌面项目。
+fn resolve_managed_workspace_in(
+    data_dir: &Path,
+    workspace_id: &str,
+) -> Result<Option<ProjectEntry>, &'static str> {
+    if !is_managed_workspace_id(workspace_id) {
+        return Ok(None);
+    }
+    let Some(managed_root) = managed_workspaces_root(data_dir, false)? else {
+        return Ok(None);
+    };
+    let target = managed_root.join(workspace_id);
+    if !target.exists() {
+        return Ok(None);
+    }
+    validate_managed_workspace(&managed_root, workspace_id).map(Some)
 }
 
 #[derive(Clone)]
@@ -693,6 +963,9 @@ fn handle_post(path: &str, request: &mut tiny_http::Request) -> OmnimindResponse
         .collect();
 
     match parts.as_slice() {
+        ["api", "v1", "managed-workspaces", workspace_id, "ensure"] => {
+            handle_ensure_managed_workspace(workspace_id)
+        }
         ["api", "v1", "document", "upload"] => handle_upload(request, query),
         ["api", "v1", "files", "save"] => {
             let body = read_request_body(request).unwrap_or_default();
@@ -717,6 +990,10 @@ fn handle_post(path: &str, request: &mut tiny_http::Request) -> OmnimindResponse
         ["api", "v1", "projects", project_id, "vector-upsert"] => {
             let body = read_request_body(request).unwrap_or_default();
             handle_vector_upsert_chunks(project_id, &body)
+        }
+        ["api", "v1", "projects", project_id, "vector-fence"] => {
+            let body = read_request_body(request).unwrap_or_default();
+            handle_vector_reserve_fence(project_id, &body)
         }
         ["api", "v1", "projects", project_id, "vector-replace"] => {
             let body = read_request_body(request).unwrap_or_default();
@@ -745,6 +1022,58 @@ fn handle_post(path: &str, request: &mut tiny_http::Request) -> OmnimindResponse
     }
 }
 
+/// Hub 调用的幂等托管 Workspace 合同：
+/// `POST /api/v1/managed-workspaces/{workspace_id}/ensure`。
+///
+/// 成功响应只包含稳定 ID 和本次是否首次创建，不返回磁盘路径；所有文件系统、项目脚手架
+/// 和底层 I/O 错误统一收敛为公开错误码，避免把 Wiki Core 的本地目录或错误正文泄漏给
+/// 上层服务。非法 ID 会在触碰文件系统之前直接失败关闭。
+fn handle_ensure_managed_workspace(workspace_id: &str) -> OmnimindResponse {
+    if !is_managed_workspace_id(workspace_id) {
+        return error_response(
+            400,
+            "INVALID_WORKSPACE_ID",
+            "workspace_id must be 32 lowercase hexadecimal characters",
+        );
+    }
+    let Some(data_dir) = app_data_dir_path() else {
+        return error_response(
+            503,
+            "WORKSPACE_STORAGE_UNAVAILABLE",
+            "Managed workspace storage is unavailable",
+        );
+    };
+
+    handle_ensure_managed_workspace_at(&data_dir, workspace_id)
+}
+
+/// 把公开 HTTP 语义与数据目录发现分开，便于单元测试在隔离临时目录中验证真实落盘，
+/// 同时确保生产响应与测试响应经过完全相同的错误收敛逻辑。
+fn handle_ensure_managed_workspace_at(data_dir: &Path, workspace_id: &str) -> OmnimindResponse {
+    if !is_managed_workspace_id(workspace_id) {
+        return error_response(
+            400,
+            "INVALID_WORKSPACE_ID",
+            "workspace_id must be 32 lowercase hexadecimal characters",
+        );
+    }
+    match ensure_managed_workspace_in(data_dir, workspace_id) {
+        Ok(result) => OmnimindResponse {
+            status: 200,
+            body: json!({
+                "ok": true,
+                "workspace_id": result.project.id,
+                "created": result.created,
+            }),
+        },
+        Err(_) => error_response(
+            500,
+            "WORKSPACE_ENSURE_FAILED",
+            "Managed workspace could not be prepared",
+        ),
+    }
+}
+
 fn handle_upload(request: &mut tiny_http::Request, query: &str) -> OmnimindResponse {
     let boundary = match get_multipart_boundary(request) {
         Some(b) => b,
@@ -763,8 +1092,14 @@ fn handle_upload(request: &mut tiny_http::Request, query: &str) -> OmnimindRespo
     // Prefer explicit projectId (query) so upload/get_file_content share the same project.
     // Fallback: current project → first project → auto-create default workspace.
     let params = parse_query(query);
-    let project = match get_target_project(params.get("projectId").map(String::as_str)) {
+    let requested_project_id = params.get("projectId").map(String::as_str);
+    let project = match get_target_project(requested_project_id) {
         Ok(p) => p,
+        // 托管 ID 是严格租户边界。尚未 ensure、损坏或不可用时必须直接失败，不能沿用
+        // 单 Workspace 安装的历史回退逻辑把上传内容写入当前桌面项目或其他租户目录。
+        Err(_) if requested_project_id.is_some_and(is_managed_workspace_id) => {
+            return error_response(404, "PROJECT_NOT_FOUND", "Project not found")
+        }
         Err(_) => {
             // Unknown projectId still falls back for light single-workspace installs;
             // auto-create only when no projects exist at all.
@@ -982,6 +1317,10 @@ struct SearchRequest {
     top_k: Option<usize>,
     include_content: Option<bool>,
     query_embedding: Option<Vec<f32>>,
+    #[serde(default, rename = "allowed_source_paths", alias = "allowedSourcePaths")]
+    allowed_source_paths: Option<Vec<String>>,
+    #[serde(default, rename = "allowed_source_hashes", alias = "allowedSourceHashes")]
+    allowed_source_hashes: Option<BTreeMap<String, String>>,
 }
 
 fn handle_search(project_id: &str, body: &str) -> OmnimindResponse {
@@ -996,40 +1335,146 @@ fn handle_search(project_id: &str, body: &str) -> OmnimindResponse {
     if req.query.trim().is_empty() {
         return error_response(400, "QUERY_REQUIRED", "query is required");
     }
-
+    let paths = match normalize_allowed_source_paths(req.allowed_source_paths.as_deref()) {
+        Ok(paths) => paths,
+        Err(message) => return error_response(400, "INVALID_ALLOWED_SOURCE_PATHS", message),
+    };
+    let hash_scope = match SourceHashScope::new(paths.as_ref(), req.allowed_source_hashes.as_ref())
+    {
+        Ok(scope) => scope,
+        Err(message) => return source_hash_failure_response(message),
+    };
+    let scope = match validate_allowed_source_files(&project.path, paths) {
+        Ok(scope) => scope,
+        Err(message) => return error_response(400, "INVALID_ALLOWED_SOURCE_PATHS", message),
+    };
+    if let Some(hashes) = &hash_scope {
+        if let Err(message) = hashes.verify_files(&scope.project_root) {
+            return source_hash_failure_response(message);
+        }
+    }
     let top_k = req.top_k.unwrap_or(10).clamp(1, 50);
     let query = req.query;
     let mode = req.mode;
-
+    // 即使调用方不请求正文，也要内部读取完整候选并核验；响应前再按旧合同移除正文。
+    let include_content = req.include_content.unwrap_or(false);
+    let needs_content = include_content || hash_scope.is_some();
+    if scope.allowed_paths.as_ref().is_some_and(BTreeSet::is_empty) {
+        return OmnimindResponse {
+            status: 200,
+            body: search_response_body(
+                &project.id,
+                commands::search::ProjectSearchResponse {
+                    mode: mode.as_str().into(),
+                    requested_mode: mode,
+                    executed_mode: mode,
+                    results: Vec::new(),
+                    token_hits: 0,
+                    vector_hits: 0,
+                    graph_hits: 0,
+                },
+            ),
+        };
+    }
     let query_embedding = if mode.uses_vector() {
-        let embedding_config = load_embedding_config();
         match tauri::async_runtime::block_on(commands::search::resolve_query_embedding(
             &query,
             req.query_embedding,
-            embedding_config,
+            load_embedding_config(),
         )) {
             Ok(embedding) => embedding,
-            Err(e) => return error_response(400, "EMBEDDING_ERROR", &e),
+            Err(_) => {
+                return error_response(400, "EMBEDDING_ERROR", "Unable to resolve query embedding")
+            }
         }
     } else {
         None
     };
-
-    match tauri::async_runtime::block_on(commands::search::search_project_by_mode_inner(
-        project.path.clone(),
-        query,
-        top_k,
-        req.include_content.unwrap_or(false),
-        query_embedding,
-        None,
-        mode,
-    )) {
-        Ok(search) => OmnimindResponse {
-            status: 200,
-            body: search_response_body(&project.id, search),
-        },
-        Err(e) => error_response(500, "SEARCH_FAILED", &e),
+    let result = if let Some(paths) = &scope.allowed_paths {
+        tauri::async_runtime::block_on(commands::search::search_project_by_mode_scoped_inner(
+            scope.project_root.clone(),
+            query.clone(),
+            top_k,
+            needs_content,
+            query_embedding,
+            paths.iter().cloned().collect(),
+            mode,
+        ))
+    } else {
+        tauri::async_runtime::block_on(commands::search::search_project_by_mode_inner(
+            scope.project_root.clone(),
+            query.clone(),
+            top_k,
+            needs_content,
+            query_embedding,
+            None,
+            mode,
+        ))
+    };
+    match result {
+        Ok(mut search) => {
+            let (mut filtered, _) = filter_results_by_allowed_source_paths(
+                search.results,
+                scope.allowed_paths.as_ref(),
+            );
+            if let Err(message) = verify_source_results(
+                hash_scope.as_ref(),
+                &scope.project_root,
+                &query,
+                &mut filtered,
+            ) {
+                return source_hash_failure_response(message);
+            }
+            if !include_content {
+                for result in &mut filtered {
+                    result.content = None;
+                }
+            }
+            search.results = filtered;
+            OmnimindResponse {
+                status: 200,
+                body: search_response_body(&project.id, search),
+            }
+        }
+        Err(_) => error_response(500, "SEARCH_FAILED", "Unable to search knowledge sources"),
     }
+}
+
+/// 哈希范围非法与版本变化使用稳定、安全的错误合同，不回显文件路径或预期正文。
+fn source_hash_failure_response(message: &str) -> OmnimindResponse {
+    if message == canonical_source::INVALID_HASHES {
+        error_response(
+            400,
+            canonical_source::INVALID_HASHES,
+            "Source hashes must match the exact source paths",
+        )
+    } else {
+        error_response(
+            409,
+            canonical_source::CONTENT_CHANGED,
+            "Authorized source content changed",
+        )
+    }
+}
+
+/// 检索前后文件哈希加候选正文哈希共同校验，阻断“被改写再恢复”的 ABA 内容竞态。
+/// 向量旧分块只参与召回评分，公开摘要重新从已验证全文生成，不能泄露旧索引中的正文。
+fn verify_source_results(
+    hashes: Option<&SourceHashScope>,
+    project_root: &str,
+    query: &str,
+    results: &mut [commands::search::ProjectSearchResult],
+) -> Result<(), &'static str> {
+    let Some(hashes) = hashes else {
+        return Ok(());
+    };
+    hashes.verify_files(project_root)?;
+    for result in results {
+        hashes.verify_candidate(&result.path, result.content.as_deref())?;
+        result.snippet =
+            commands::search::build_snippet(result.content.as_deref().unwrap_or(""), query);
+    }
+    Ok(())
 }
 
 fn search_response_body(
@@ -1076,6 +1521,57 @@ struct VectorUpsertRequest {
 #[derive(Deserialize)]
 struct VectorReplaceRequest {
     pages: Vec<commands::vectorstore::PageChunkReplaceInput>,
+    #[serde(default)]
+    fence: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VectorFenceRequest {
+    fence: String,
+}
+
+/// fence 冲突是可识别的并发拒绝，不能伪装为通用服务故障并诱发盲目重试。
+fn vector_fence_error(error: &str) -> Option<OmnimindResponse> {
+    match error {
+        commands::vectorstore::fencing::CONFLICT => Some(error_response(
+            409,
+            "VECTOR_FENCE_CONFLICT",
+            "Vector build fence does not match",
+        )),
+        commands::vectorstore::fencing::INVALID => Some(error_response(
+            400,
+            "INVALID_VECTOR_FENCE",
+            "Invalid vector build fence",
+        )),
+        _ => None,
+    }
+}
+
+fn handle_vector_reserve_fence(project_id: &str, body: &str) -> OmnimindResponse {
+    let request: VectorFenceRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(_) => return error_response(400, "INVALID_VECTOR_FENCE", "Invalid vector build fence"),
+    };
+    let project = match resolve_project(project_id) {
+        Ok(project) => project,
+        Err(e) => return error_response(404, "PROJECT_NOT_FOUND", &e),
+    };
+    match tauri::async_runtime::block_on(commands::vectorstore::vector_reserve_fence(
+        project.path.clone(),
+        request.fence.clone(),
+    )) {
+        Ok(()) => OmnimindResponse {
+            status: 200,
+            body: json!({ "ok": true, "fence": request.fence }),
+        },
+        Err(error) => vector_fence_error(&error).unwrap_or_else(|| {
+            error_response(
+                500,
+                "VECTOR_FENCE_STORAGE_FAILED",
+                "Unable to reserve vector build fence",
+            )
+        }),
+    }
 }
 
 fn handle_vector_upsert_chunks(project_id: &str, body: &str) -> OmnimindResponse {
@@ -1098,7 +1594,13 @@ fn handle_vector_upsert_chunks(project_id: &str, body: &str) -> OmnimindResponse
             status: 200,
             body: json!({ "ok": true, "message": "Vector chunks successfully upserted" }),
         },
-        Err(e) => error_response(500, "VECTOR_UPSERT_FAILED", &e),
+        Err(e) => vector_fence_error(&e).unwrap_or_else(|| {
+            error_response(
+                500,
+                "VECTOR_UPSERT_FAILED",
+                "Unable to upsert vector chunks",
+            )
+        }),
     }
 }
 
@@ -1114,19 +1616,22 @@ fn handle_vector_replace_all_chunks(project_id: &str, body: &str) -> OmnimindRes
         Err(e) => return error_response(404, "PROJECT_NOT_FOUND", &e),
     };
 
-    match tauri::async_runtime::block_on(commands::vectorstore::vector_replace_all_chunks(
+    match tauri::async_runtime::block_on(commands::vectorstore::vector_replace_all_chunks_fenced(
         project.path.clone(),
         request.pages,
+        request.fence,
     )) {
         Ok(()) => OmnimindResponse {
             status: 200,
             body: json!({ "ok": true, "project_id": project_id }),
         },
-        Err(_) => error_response(
-            500,
-            "VECTOR_INDEX_REPLACE_FAILED",
-            "Unable to replace vector index",
-        ),
+        Err(error) => vector_fence_error(&error).unwrap_or_else(|| {
+            error_response(
+                500,
+                "VECTOR_INDEX_REPLACE_FAILED",
+                "Unable to replace vector index",
+            )
+        }),
     }
 }
 
@@ -1154,7 +1659,13 @@ fn handle_vector_delete_page(project_id: &str, body: &str) -> OmnimindResponse {
             status: 200,
             body: json!({ "ok": true, "message": "Page vectors successfully deleted" }),
         },
-        Err(e) => error_response(500, "VECTOR_DELETE_FAILED", &e),
+        Err(e) => vector_fence_error(&e).unwrap_or_else(|| {
+            error_response(
+                500,
+                "VECTOR_DELETE_FAILED",
+                "Unable to delete vector chunks",
+            )
+        }),
     }
 }
 
@@ -1185,8 +1696,8 @@ fn handle_vector_index_status(project_id: &str) -> OmnimindResponse {
 
 /// 清空 Core 原生分块索引。
 ///
-/// Python 重建器必须先把全部页面切块和向量化成功，才会调用本接口；这样 Embedding
-/// Provider 暂时失败时不会提前破坏仍可用的旧索引。
+/// 仅供未采用 fence 的旧项目使用；受保护项目必须通过带代次的原子全量替换维护索引，
+/// 禁止旧 clear 请求删除已经由新构建发布的索引。
 fn handle_vector_clear_chunks(project_id: &str) -> OmnimindResponse {
     let project = match resolve_project(project_id) {
         Ok(project) => project,
@@ -1200,11 +1711,13 @@ fn handle_vector_clear_chunks(project_id: &str) -> OmnimindResponse {
             status: 200,
             body: json!({ "ok": true, "project_id": project_id }),
         },
-        Err(_) => error_response(
-            500,
-            "VECTOR_INDEX_CLEAR_FAILED",
-            "Unable to clear vector index",
-        ),
+        Err(error) => vector_fence_error(&error).unwrap_or_else(|| {
+            error_response(
+                500,
+                "VECTOR_INDEX_CLEAR_FAILED",
+                "Unable to clear vector index",
+            )
+        }),
     }
 }
 
@@ -1263,6 +1776,12 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
                 return error_response(400, "INVALID_ALLOWED_SOURCE_PATHS", message);
             }
         };
+    let hash_scope = match SourceHashScope::new(
+        normalized_allowed_source_paths.as_ref(), request.allowed_source_hashes.as_ref(),
+    ) {
+        Ok(scope) => scope,
+        Err(message) => return source_hash_failure_response(message),
+    };
     let validated_source_scope =
         match validate_allowed_source_files(&project.path, normalized_allowed_source_paths) {
             Ok(scope) => scope,
@@ -1270,6 +1789,11 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
                 return error_response(400, "INVALID_ALLOWED_SOURCE_PATHS", message);
             }
         };
+    if let Some(hashes) = &hash_scope {
+        if let Err(message) = hashes.verify_files(&validated_source_scope.project_root) {
+            return source_hash_failure_response(message);
+        }
+    }
     let allowed_source_paths = validated_source_scope.allowed_paths;
 
     let budget = compute_context_budget(request.max_context_size);
@@ -1326,7 +1850,7 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
 
     let search_result = if allowed_source_paths.is_some() {
         tauri::async_runtime::block_on(commands::search::search_project_scoped_inner(
-            validated_source_scope.project_root,
+            validated_source_scope.project_root.clone(),
             request.query.clone(),
             top_k,
             true, // include_content
@@ -1336,7 +1860,7 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
     } else {
         // allowlist 省略时继续走历史搜索入口，向量查询保持全项目行为。
         tauri::async_runtime::block_on(commands::search::search_project_inner(
-            validated_source_scope.project_root,
+            validated_source_scope.project_root.clone(),
             request.query.clone(),
             top_k,
             true,
@@ -1353,8 +1877,13 @@ fn handle_chat_context(project_id: &str, body: &str) -> OmnimindResponse {
     // BM25、Vector、Graph 还是 RRF，都没有未授权候选借排序或预算分支进入 Prompt。
     // 当 allowlist 已提供但没有任何精确匹配时，`filtered_results` 保持为空；后续会
     // 返回合法 EMPTY_CONTEXT，绝不为了“有答案”而放宽回全库。
-    let (filtered_results, source_filter_stats) =
+    let (mut filtered_results, source_filter_stats) =
         filter_results_by_allowed_source_paths(search.results, allowed_source_paths.as_ref());
+    if let Err(message) = verify_source_results(
+        hash_scope.as_ref(), &validated_source_scope.project_root, &request.query, &mut filtered_results,
+    ) {
+        return source_hash_failure_response(message);
+    }
     let ordered = order_results_for_context(retrieval_mode, filtered_results);
     let (context_blocks, references) =
         assemble_context_blocks(ordered, &budget, effective_max_block_chars);
@@ -1844,11 +2373,15 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn get_app_data_dir() -> Option<PathBuf> {
+/// 计算 Wiki Core 自身数据目录的位置，但不要求目录已经存在。
+///
+/// 既有 app-state 读取仍通过 `get_app_data_dir` 保持“目录存在才读取”的行为；托管
+/// Workspace ensure 则使用本函数并在受控边界内创建目录，从而支持全新 server-only
+/// 安装首次启动时自动为租户准备知识空间。
+fn app_data_dir_path() -> Option<PathBuf> {
     if let Ok(dir) = env::var("OMNIMIND_WIKI_CORE_DATA_DIR") {
-        let path = PathBuf::from(dir);
-        if path.exists() {
-            return Some(path);
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir));
         }
     }
 
@@ -1864,11 +2397,11 @@ fn get_app_data_dir() -> Option<PathBuf> {
         PathBuf::from(home).join(".local/share/com.llmwiki.app")
     };
 
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    Some(path)
+}
+
+fn get_app_data_dir() -> Option<PathBuf> {
+    app_data_dir_path().filter(|path| path.exists())
 }
 
 fn load_app_state() -> Option<Value> {
@@ -1960,15 +2493,39 @@ fn load_projects() -> Vec<ProjectEntry> {
 
 fn resolve_project(project_id: &str) -> Result<ProjectEntry, String> {
     let project_id = percent_decode(project_id);
+    resolve_project_from_entries(&project_id, load_projects(), get_app_data_dir().as_deref())
+}
+
+/// 统一既有桌面项目和 Hub 托管 Workspace 的项目解析规则。
+///
+/// 32 位托管 ID 是保留命名空间，必须只解析到 Wiki 数据目录里的确定性租户目录；即使
+/// app-state 或 clip-server 恰好出现同名项目，也不能覆盖该租户映射。其他 ID 与
+/// `current` 完整保留历史匹配顺序，确保桌面 app-state/clip-server 行为不回归。
+fn resolve_project_from_entries(
+    project_id: &str,
+    projects: Vec<ProjectEntry>,
+    app_data_dir: Option<&Path>,
+) -> Result<ProjectEntry, String> {
+    if is_managed_workspace_id(project_id) {
+        let Some(data_dir) = app_data_dir else {
+            return Err("Project not found".to_string());
+        };
+        return match resolve_managed_workspace_in(data_dir, project_id) {
+            Ok(Some(project)) => Ok(project),
+            Ok(None) => Err("Project not found".to_string()),
+            Err(_) => Err("Project is unavailable".to_string()),
+        };
+    }
+
     let wants_current = project_id.eq_ignore_ascii_case("current");
-    load_projects()
+    projects
         .into_iter()
         .find(|p| {
             p.id == project_id
-                || project_path_matches(&p.path, &project_id)
+                || project_path_matches(&p.path, project_id)
                 || (wants_current && p.current)
         })
-        .ok_or_else(|| format!("Unknown project: {project_id}"))
+        .ok_or_else(|| "Project not found".to_string())
 }
 
 fn project_path_matches(stored_path: &str, candidate: &str) -> bool {
@@ -2424,12 +2981,17 @@ fn handle_extract_text_from_content(req: &ExtractTextRequest) -> OmnimindRespons
             let _ = fs::remove_file(&temp_path);
             text
         }
-        Err(e) => {
+        Err(_) => {
             let _ = fs::remove_file(&temp_path);
-            return map_read_file_error(&e);
+            return error_response(422, "EXTRACT_FAILED", "Unable to extract complete canonical source");
         }
     };
 
+    if let Err(code) = canonical_source::validate_text(&content, &extension) {
+        return error_response(422, code, "Document contains no extractable canonical text");
+    }
+    let original_sha256 = canonical_source::sha256(&bytes);
+    let canonical_sha256 = canonical_source::sha256(content.as_bytes());
     let chars = content.chars().count();
     OmnimindResponse {
         status: 200,
@@ -2439,6 +3001,9 @@ fn handle_extract_text_from_content(req: &ExtractTextRequest) -> OmnimindRespons
             "extension": extension,
             "content": content,
             "chars": chars,
+            "original_sha256": original_sha256,
+            "canonical_sha256": canonical_sha256,
+            "extractor_version": canonical_source::EXTRACTOR_VERSION,
         }),
     }
 }
@@ -2750,6 +3315,162 @@ mod tests {
     }
 
     #[test]
+    fn managed_workspace_ensure_creates_complete_tenant_project() {
+        let data_dir = test_dir("managed-workspace-create");
+        let workspace_id = "0123456789abcdef0123456789abcdef";
+
+        let response = handle_ensure_managed_workspace_at(&data_dir, workspace_id);
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["ok"], true);
+        assert_eq!(response.body["workspace_id"], workspace_id);
+        assert_eq!(response.body["created"], true);
+        assert!(
+            !response
+                .body
+                .to_string()
+                .contains(&data_dir.to_string_lossy().to_string()),
+            "公开 ensure 响应不得包含 Wiki 数据目录"
+        );
+
+        let workspace = data_dir.join(MANAGED_WORKSPACES_DIR).join(workspace_id);
+        for relative in MANAGED_WORKSPACE_REQUIRED_DIRS {
+            assert!(
+                workspace.join(relative).is_dir(),
+                "缺少标准目录: {relative}"
+            );
+        }
+        for relative in MANAGED_WORKSPACE_REQUIRED_FILES {
+            assert!(
+                workspace.join(relative).is_file(),
+                "缺少标准文件: {relative}"
+            );
+        }
+        let identity: Value = serde_json::from_str(
+            &fs::read_to_string(workspace.join(".llm-wiki/project.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(identity["id"], workspace_id);
+        assert_eq!(identity["managedBy"], "omnimind-hub");
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn managed_workspace_repeated_ensure_is_a_real_noop() {
+        let data_dir = test_dir("managed-workspace-noop");
+        let workspace_id = "11111111111111111111111111111111";
+        let first = ensure_managed_workspace_in(&data_dir, workspace_id).unwrap();
+        assert!(first.created);
+
+        let identity_path = data_dir
+            .join(MANAGED_WORKSPACES_DIR)
+            .join(workspace_id)
+            .join(".llm-wiki/project.json");
+        let original_identity = fs::read(&identity_path).unwrap();
+        let sentinel_path = data_dir
+            .join(MANAGED_WORKSPACES_DIR)
+            .join(workspace_id)
+            .join("wiki/tenant-content.md");
+        fs::write(&sentinel_path, "tenant-owned content").unwrap();
+
+        let second = ensure_managed_workspace_in(&data_dir, workspace_id).unwrap();
+
+        assert!(!second.created);
+        assert_eq!(first.project.path, second.project.path);
+        assert_eq!(fs::read(identity_path).unwrap(), original_identity);
+        assert_eq!(
+            fs::read_to_string(sentinel_path).unwrap(),
+            "tenant-owned content"
+        );
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn managed_workspace_invalid_ids_fail_closed_before_writing() {
+        let data_dir = test_dir("managed-workspace-invalid");
+        let invalid_ids = [
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "g123456789abcdef0123456789abcdef",
+            "../../0123456789abcdef0123456789ab",
+            "%300123456789abcdef0123456789abcd",
+        ];
+
+        for invalid_id in invalid_ids {
+            let response = handle_ensure_managed_workspace_at(&data_dir, invalid_id);
+            assert_eq!(response.status, 400, "非法 ID 必须失败关闭: {invalid_id}");
+            assert_eq!(response.body["error"]["code"], "INVALID_WORKSPACE_ID");
+            assert!(
+                invalid_id.is_empty() || !response.body.to_string().contains(invalid_id),
+                "公开错误不得回显调用方提交的非法 ID"
+            );
+        }
+        assert!(
+            !data_dir.join(MANAGED_WORKSPACES_DIR).exists(),
+            "非法 ID 不得触碰托管 Workspace 文件系统"
+        );
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn managed_workspaces_are_isolated_and_reserved_ids_ignore_legacy_registry() {
+        let data_dir = test_dir("managed-workspace-isolation");
+        let tenant_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let tenant_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let workspace_a = ensure_managed_workspace_in(&data_dir, tenant_a).unwrap();
+        let workspace_b = ensure_managed_workspace_in(&data_dir, tenant_b).unwrap();
+        assert_ne!(workspace_a.project.path, workspace_b.project.path);
+
+        let tenant_a_secret = Path::new(&workspace_a.project.path).join("wiki/tenant-a.md");
+        fs::write(&tenant_a_secret, "tenant-a-only").unwrap();
+        assert!(
+            !Path::new(&workspace_b.project.path)
+                .join("wiki/tenant-a.md")
+                .exists(),
+            "租户 B 目录不得看到租户 A 的内容"
+        );
+
+        // 32 位托管 ID 属于保留命名空间。即使旧 app-state 出现同名条目，也必须稳定
+        // 解析到数据目录中的托管租户目录，不能被任意外部路径劫持。
+        let fake_legacy = ProjectEntry {
+            id: tenant_a.to_string(),
+            name: "Legacy Collision".to_string(),
+            path: workspace_b.project.path.clone(),
+            current: true,
+        };
+        let resolved =
+            resolve_project_from_entries(tenant_a, vec![fake_legacy], Some(&data_dir)).unwrap();
+        assert_eq!(resolved.path, workspace_a.project.path);
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn legacy_app_state_and_clip_projects_keep_existing_resolution_behavior() {
+        let legacy = ProjectEntry {
+            id: "legacy-project".to_string(),
+            name: "Legacy Project".to_string(),
+            path: "/tmp/legacy-project".to_string(),
+            current: true,
+        };
+
+        let by_id =
+            resolve_project_from_entries("legacy-project", vec![legacy.clone()], None).unwrap();
+        assert_eq!(by_id.path, legacy.path);
+        let current = resolve_project_from_entries("current", vec![legacy.clone()], None).unwrap();
+        assert_eq!(current.id, legacy.id);
+        let by_path =
+            resolve_project_from_entries(&legacy.path, vec![legacy.clone()], None).unwrap();
+        assert_eq!(by_path.id, legacy.id);
+    }
+
+    #[test]
     fn parse_retrieval_mode_defaults_and_aliases() {
         assert_eq!(parse_retrieval_mode(None), RetrievalMode::Wiki);
         assert_eq!(parse_retrieval_mode(Some("")), RetrievalMode::Wiki);
@@ -2770,6 +3491,143 @@ mod tests {
         assert_eq!(parse_retrieval_mode(Some("hybrid")), RetrievalMode::Hybrid);
         assert_eq!(parse_retrieval_mode(Some("all")), RetrievalMode::Hybrid);
         assert_eq!(parse_retrieval_mode(Some("unknown")), RetrievalMode::Wiki);
+    }
+
+    #[test]
+    fn canonical_content_extraction_signs_full_native_text_and_original_bytes() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let bytes = canonical_source::tests::xlsx_fixture(Some(canonical_source::tests::PRECISE_SHEET));
+        let body = json!({ "extension": "xlsx", "contentBase64": STANDARD.encode(&bytes) }).to_string();
+        let response = handle_extract_text(&body);
+        assert_eq!(response.status, 200, "{:?}", response.body);
+        let content = response.body["content"].as_str().unwrap();
+        assert!(content.contains("第二表独有误差"));
+        assert!(content.contains("0.001"));
+        assert_eq!(
+            response.body["canonical_sha256"],
+            canonical_source::sha256(content.as_bytes())
+        );
+        assert_eq!(
+            response.body["original_sha256"],
+            canonical_source::sha256(&bytes)
+        );
+        assert_eq!(
+            response.body["extractor_version"],
+            "omnimind-canonical-source-v1"
+        );
+        let repeated = handle_extract_text(&body);
+        assert_eq!(
+            response.body["canonical_sha256"],
+            repeated.body["canonical_sha256"]
+        );
+        let empty = handle_extract_text(
+            &json!({ "extension": "txt", "contentBase64": STANDARD.encode(b" \n") }).to_string(),
+        );
+        assert_eq!(empty.status, 422);
+        assert_eq!(empty.body["error"]["code"], "EMPTY_CANONICAL_SOURCE");
+    }
+
+    #[test]
+    fn source_hash_wire_accepts_precise_snake_case_scope_on_both_routes() {
+        let body = json!({ "query": "alpha", "allowed_source_paths": ["wiki/a.md"],
+            "allowed_source_hashes": { "wiki/a.md": canonical_source::sha256(b"alpha") } })
+        .to_string();
+        let chat: ChatContextRequest = serde_json::from_str(&body).unwrap();
+        let search: SearchRequest = serde_json::from_str(&body).unwrap();
+        assert_eq!(chat.allowed_source_paths, search.allowed_source_paths);
+        assert_eq!(chat.allowed_source_hashes, search.allowed_source_hashes);
+        let legacy: SearchRequest = serde_json::from_str(r#"{"query":"alpha"}"#).unwrap();
+        assert!(legacy.allowed_source_hashes.is_none());
+        assert_eq!(
+            source_hash_failure_response(canonical_source::INVALID_HASHES).status,
+            400
+        );
+        assert_eq!(
+            source_hash_failure_response(canonical_source::CONTENT_CHANGED).status,
+            409
+        );
+    }
+
+    #[tokio::test]
+    async fn source_hash_scoped_modes_exclude_unknown_pages_and_verify_returned_bytes() {
+        use commands::search::SearchMode;
+        let root = env::temp_dir().join(format!("canonical-mode-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("wiki")).unwrap();
+        let content = "# Alpha 可信资料\nalpha 净重 4.3 kg。[[unknown]]";
+        fs::write(root.join("wiki/allowed.md"), content).unwrap();
+        fs::write(
+            root.join("wiki/unknown.md"),
+            "# Alpha\nalpha 未授权秘密 999 kg",
+        )
+        .unwrap();
+        let project_root = root.to_string_lossy().to_string();
+        for name in ["allowed", "unknown"] {
+            commands::vectorstore::vector_upsert_chunks(
+                project_root.clone(),
+                name.into(),
+                vec![commands::vectorstore::ChunkUpsertInput {
+                    chunk_index: 0,
+                    chunk_text: "旧索引秘密 999 kg".into(),
+                    heading_path: String::new(),
+                    embedding: vec![1.0, 0.0, 0.0],
+                }],
+            )
+            .await
+            .unwrap();
+        }
+        let paths = BTreeSet::from(["wiki/allowed.md".into()]);
+        let hashes = BTreeMap::from([(
+            "wiki/allowed.md".into(),
+            canonical_source::sha256(content.as_bytes()),
+        )]);
+        let scope = SourceHashScope::new(Some(&paths), Some(&hashes))
+            .unwrap()
+            .unwrap();
+        for mode in [
+            SearchMode::Bm25,
+            SearchMode::Vector,
+            SearchMode::Graph,
+            SearchMode::Hybrid,
+        ] {
+            scope.verify_files(&project_root).unwrap();
+            let embedding = mode.uses_vector().then(|| vec![1.0, 0.0, 0.0]);
+            let mut search = commands::search::search_project_by_mode_scoped_inner(
+                project_root.clone(),
+                "alpha".into(),
+                10,
+                true,
+                embedding,
+                vec!["wiki/allowed.md".into()],
+                mode,
+            )
+            .await
+            .unwrap();
+            assert_eq!(search.requested_mode, mode);
+            assert!(search
+                .results
+                .iter()
+                .all(|result| result.path == "wiki/allowed.md"));
+            if mode != SearchMode::Graph {
+                assert!(!search.results.is_empty());
+            }
+            verify_source_results(Some(&scope), &project_root, "alpha", &mut search.results).unwrap();
+            assert!(search
+                .results
+                .iter()
+                .all(|result| !result.snippet.contains("999")));
+        }
+        let mut candidate = sample_result("wiki/allowed.md", "Alpha", 1.0);
+        candidate.content = Some("被瞬间改写又恢复的正文".into());
+        assert_eq!(
+            verify_source_results(Some(&scope), &project_root, "alpha", &mut [candidate]),
+            Err(canonical_source::CONTENT_CHANGED)
+        );
+        fs::write(root.join("wiki/allowed.md"), "变更后的来源").unwrap();
+        assert_eq!(
+            verify_source_results(Some(&scope), &project_root, "alpha", &mut []),
+            Err(canonical_source::CONTENT_CHANGED)
+        );
+        // Lance 仍可能持有临时文件句柄，沿用向量回归的临时目录保留策略，不碰任何用户项目。
     }
 
     #[test]
@@ -2833,6 +3691,7 @@ mod tests {
             include_debug: false,
             retrieval_mode: Some("sources_only".into()),
             allowed_source_paths: None,
+            allowed_source_hashes: None,
         };
         let inactive_filter = SourceFilterStats {
             active: false,
@@ -3423,9 +4282,34 @@ mod tests {
     }
 
     #[test]
+    fn vector_fence_wire_keeps_u64_precision_and_stable_conflict() {
+        let request: VectorFenceRequest =
+            serde_json::from_str(r#"{"fence":"18446744073709551615"}"#).unwrap();
+        assert_eq!(request.fence, "18446744073709551615");
+        assert!(serde_json::from_str::<VectorFenceRequest>(r#"{"fence":123}"#).is_err());
+        assert!(serde_json::from_str::<VectorFenceRequest>(r#"{}"#).is_err());
+        let replacement: VectorReplaceRequest =
+            serde_json::from_str(r#"{"pages":[],"fence":"123"}"#).unwrap();
+        assert_eq!(replacement.fence.as_deref(), Some("123"));
+        assert_eq!(
+            vector_fence_error(commands::vectorstore::fencing::CONFLICT)
+                .unwrap()
+                .status,
+            409
+        );
+        assert_eq!(
+            vector_fence_error(commands::vectorstore::fencing::INVALID)
+                .unwrap()
+                .status,
+            400
+        );
+    }
+
+    #[test]
     fn vector_index_management_routes_fail_closed_for_unknown_project() {
         for response in [
             handle_vector_index_status("definitely-missing-project"),
+            handle_vector_reserve_fence("definitely-missing-project", r#"{"fence":"1"}"#),
             handle_vector_clear_chunks("definitely-missing-project"),
             handle_vector_optimize_chunks("definitely-missing-project"),
             handle_vector_replace_all_chunks("definitely-missing-project", r#"{"pages":[]}"#),

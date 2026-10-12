@@ -554,6 +554,32 @@ async fn search_project_inner_with_scope(
     Ok(response)
 }
 
+/// 显式来源授权下保留调用方的算子模式；向量候选在 ANN top-k 前按同一清单过滤。
+/// 仅复用已有执行内核，不通过全库检索后过滤模拟 scoped 检索。
+pub async fn search_project_by_mode_scoped_inner(
+    project_path: String,
+    query: String,
+    top_k: usize,
+    include_content: bool,
+    query_embedding: Option<Vec<f32>>,
+    scan_roots: Vec<String>,
+    mode: SearchMode,
+) -> Result<ProjectSearchResponse, String> {
+    let scan_roots = normalize_scoped_scan_roots(scan_roots)?;
+    search_project_by_mode_with_vector_search(
+        project_path,
+        query,
+        top_k,
+        include_content,
+        query_embedding,
+        Some(scan_roots),
+        mode,
+        search_by_embedding_boxed,
+        true,
+    )
+    .await
+}
+
 pub async fn search_project_by_mode_inner(
     project_path: String,
     query: String,

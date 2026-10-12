@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::panic_guard::run_guarded_async;
 
+pub mod fencing;
+
 /// v1 per-page result (legacy — kept so pre-0.3.11 projects still load).
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VectorSearchResult {
@@ -525,6 +527,8 @@ pub async fn vector_upsert_chunks(
         validate_page_id_for_v2(&page_id)?;
         let lock = vectorstore_v2_lock(&project_path);
         let _guard = lock.write().await;
+        // 受全量构建代次保护后，旧增量/清空入口不能绕过已提交版本。
+        fencing::check_write(&project_path, None)?;
 
         if chunks.is_empty() {
             return Ok(());
@@ -593,9 +597,27 @@ pub async fn vector_replace_all_chunks(
     project_path: String,
     pages: Vec<PageChunkReplaceInput>,
 ) -> Result<(), String> {
+    vector_replace_all_chunks_fenced(project_path, pages, None).await
+}
+
+/// reserve 与真正的表替换共用项目锁：Python 锁过期或 HTTP 取消均不能让旧提交越过新代次。
+pub async fn vector_reserve_fence(project_path: String, fence: String) -> Result<(), String> {
+    let lock = vectorstore_v2_lock(&project_path);
+    let _guard = lock.write().await;
+    fencing::reserve(&project_path, &fence)
+}
+
+/// HTTP 全量构建入口。旧 Tauri 命令走 None，仅未采用 fence 的项目允许继续使用。
+pub async fn vector_replace_all_chunks_fenced(
+    project_path: String,
+    pages: Vec<PageChunkReplaceInput>,
+    fence: Option<String>,
+) -> Result<(), String> {
     run_guarded_async("vector_replace_all_chunks", async move {
         let lock = vectorstore_v2_lock(&project_path);
         let _guard = lock.write().await;
+        // 必须把校验、批次验证与 Overwrite 放在同一个锁的生命周期内。
+        fencing::check_write(&project_path, fence.as_deref())?;
 
         let first_chunk = pages
             .iter()
@@ -795,6 +817,8 @@ pub async fn vector_delete_page(project_path: String, page_id: String) -> Result
         validate_page_id_for_v2(&page_id)?;
         let lock = vectorstore_v2_lock(&project_path);
         let _guard = lock.write().await;
+        // 受全量构建代次保护后，旧增量/清空入口不能绕过已提交版本。
+        fencing::check_write(&project_path, None)?;
 
         let db = connect(&db_path(&project_path))
             .execute()
@@ -874,6 +898,8 @@ pub async fn vector_clear_chunks(project_path: String) -> Result<(), String> {
     run_guarded_async("vector_clear_chunks", async move {
         let lock = vectorstore_v2_lock(&project_path);
         let _guard = lock.write().await;
+        // 受全量构建代次保护后，旧增量/清空入口不能绕过已提交版本。
+        fencing::check_write(&project_path, None)?;
 
         let db = connect(&db_path(&project_path))
             .execute()
@@ -1231,6 +1257,99 @@ mod tests_v2 {
             .unwrap();
 
         assert_eq!(vector_count_chunks(pp.clone()).await.unwrap(), 7);
+    }
+
+    /// 重现已收到但晚提交的旧 HTTP：较新代次提交后才释放旧请求，物理表仍必须是新版本。
+    #[tokio::test]
+    async fn v2_fence_rejects_delayed_replace_and_legacy_mutation_bypasses() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+        vector_reserve_fence(pp.clone(), "100".into())
+            .await
+            .unwrap();
+        let (release, delayed) = tokio::sync::oneshot::channel::<()>();
+        let old_project = pp.clone();
+        let old = tokio::spawn(async move {
+            delayed.await.unwrap();
+            vector_replace_all_chunks_fenced(
+                old_project,
+                vec![PageChunkReplaceInput {
+                    page_id: "stale".into(),
+                    chunks: make_chunks("stale", 4, 16),
+                }],
+                Some("100".into()),
+            )
+            .await
+        });
+        vector_reserve_fence(pp.clone(), "101".into())
+            .await
+            .unwrap();
+        vector_replace_all_chunks_fenced(
+            pp.clone(),
+            vec![PageChunkReplaceInput {
+                page_id: "current".into(),
+                chunks: make_chunks("current", 2, 16),
+            }],
+            Some("101".into()),
+        )
+        .await
+        .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(old.await.unwrap().unwrap_err(), fencing::CONFLICT);
+        assert_eq!(
+            vector_reserve_fence(pp.clone(), "100".into())
+                .await
+                .unwrap_err(),
+            fencing::CONFLICT
+        );
+        assert_eq!(
+            vector_replace_all_chunks(pp.clone(), vec![])
+                .await
+                .unwrap_err(),
+            fencing::CONFLICT
+        );
+        assert_eq!(
+            vector_upsert_chunks(pp.clone(), "stale".into(), make_chunks("stale", 1, 16))
+                .await
+                .unwrap_err(),
+            fencing::CONFLICT
+        );
+        assert_eq!(
+            vector_delete_page(pp.clone(), "current".into())
+                .await
+                .unwrap_err(),
+            fencing::CONFLICT
+        );
+        assert_eq!(
+            vector_clear_chunks(pp.clone()).await.unwrap_err(),
+            fencing::CONFLICT
+        );
+        assert_eq!(vector_count_chunks(pp.clone()).await.unwrap(), 2);
+        let results = vector_search_chunks(pp, fake_embedding(0, 16), 10)
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|row| row.page_id == "current"));
+    }
+
+    /// reserve 必须等待同一个写锁，禁止在旧写入仍可能提交时提前确认新代次。
+    #[tokio::test]
+    async fn v2_fence_reservation_waits_for_the_commit_lock() {
+        let p = tmp_project();
+        let pp = p.to_string_lossy().to_string();
+        vector_reserve_fence(pp.clone(), "1".into()).await.unwrap();
+        let lock = vectorstore_v2_lock(&pp);
+        let guard = lock.write().await;
+        let pending = vector_reserve_fence(pp.clone(), "2".into());
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert!(fencing::check_write(&pp, Some("1")).is_ok());
+        drop(guard);
+        pending.await.unwrap();
+        assert_eq!(
+            fencing::check_write(&pp, Some("1")).unwrap_err(),
+            fencing::CONFLICT
+        );
     }
 
     #[tokio::test]
